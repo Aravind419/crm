@@ -508,13 +508,29 @@ router.post('/onboarding', requireRoles(['OWNER', 'ADMIN']), async (req: Authent
     }
 
     if (completed === true) {
-      const effectiveName = companyName ? String(companyName).trim() : currentOrg.name;
-      const effectiveBrandColor = brandColor ? String(brandColor).trim() : currentOrg.brandColor;
-      const effectiveTimezone = timezone ? String(timezone).trim() : currentOrg.timezone;
-      const effectiveLocale = locale ? String(locale).trim() : currentOrg.locale;
-      const effectiveHours = validatedHoursJson ? JSON.parse(validatedHoursJson) : (currentOrg.businessHours ? JSON.parse(currentOrg.businessHours) : null);
-      const effectiveWorkspace = workspaceName ? String(workspaceName).trim() : (currentOrg.workspaces[0]?.name || null);
-      const effectiveGreeting = inboxGreeting ? String(inboxGreeting).trim() : (currentOrg.inboxes[0]?.greeting || null);
+      const effectiveName = typeof companyName === 'string' && companyName.trim().length > 0 ? companyName.trim() : (typeof currentOrg.name === 'string' ? currentOrg.name.trim() : '');
+      const effectiveBrandColor = typeof brandColor === 'string' && brandColor.trim().length > 0 ? brandColor.trim() : (typeof currentOrg.brandColor === 'string' ? currentOrg.brandColor.trim() : '');
+      const effectiveTimezone = typeof timezone === 'string' && timezone.trim().length > 0 ? timezone.trim() : (typeof currentOrg.timezone === 'string' ? currentOrg.timezone.trim() : '');
+      const effectiveLocale = typeof locale === 'string' && locale.trim().length > 0 ? locale.trim() : (typeof currentOrg.locale === 'string' ? currentOrg.locale.trim() : '');
+
+      let parsedCurrentHours: any = null;
+      if (typeof currentOrg.businessHours === 'string' && currentOrg.businessHours.trim().length > 0) {
+        try {
+          parsedCurrentHours = JSON.parse(currentOrg.businessHours);
+        } catch {
+          parsedCurrentHours = null;
+        }
+      } else if (currentOrg.businessHours && typeof currentOrg.businessHours === 'object') {
+        parsedCurrentHours = currentOrg.businessHours;
+      }
+      const effectiveHours = validatedHoursJson ? JSON.parse(validatedHoursJson) : parsedCurrentHours;
+
+      const effectiveWorkspace = typeof workspaceName === 'string' && workspaceName.trim().length > 0
+        ? workspaceName.trim()
+        : (currentOrg.workspaces[0]?.name || null);
+      const effectiveGreeting = typeof inboxGreeting === 'string' && inboxGreeting.trim().length > 0
+        ? inboxGreeting.trim()
+        : (currentOrg.inboxes[0]?.greeting || null);
 
       const missingFields: string[] = [];
       if (!effectiveName) missingFields.push('companyName');

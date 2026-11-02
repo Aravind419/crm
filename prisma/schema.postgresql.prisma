@@ -92,8 +92,8 @@ model Organization {
   brandColor          String    @default("#2563EB")
   timezone            String    @default("UTC")
   locale              String    @default("en")
-  businessHours       Json?
-  allowedDomains      Json?
+  businessHours       String?  // JSON string: { enabled: boolean, days: number[], startTime: string, endTime: string, timezone: string }
+  allowedDomains      String?  // JSON string or comma-separated allowed website domains
   onboardingCompleted Boolean   @default(false)
   onboardingStep      Int       @default(1)
   createdAt           DateTime  @default(now())

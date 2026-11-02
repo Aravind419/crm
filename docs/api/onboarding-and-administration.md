@@ -252,10 +252,45 @@ Rotates invitation token hash, generates a new 7-day expiration, and re-triggers
 
 ### `DELETE /api/v1/users/:id/invitation`
 Revokes an outstanding invitation.
-
+- **Lifecycle Guarantee**: Retains the user record with status `DEACTIVATED`, clears `invitationTokenHash` and `invitationExpiresAt`, and preserves an audit trail event (`INVITATION_REVOKED`).
+- **Access Defense**: Revoked tokens cannot be inspected or accepted (`HTTP 404`). Resend on a revoked user is blocked (`HTTP 400`). To reinvite, use the explicit re-invitation workflow.
 - **Authentication**: `Bearer <JWT>`
 - **Authorization**: `OWNER` or `ADMIN`.
-- **Response (200 OK)**: `{ "message": "Invitation revoked successfully" }`.
+- **Response (200 OK)**:
+  ```json
+  {
+    "message": "Invitation revoked successfully",
+    "status": "DEACTIVATED"
+  }
+  ```
+
+---
+
+### `POST /api/v1/users/:id/invitation/reinvite`
+Explicit re-invitation workflow for a previously revoked or deactivated user.
+- **Concurrency & Quota Control**: Locks the organization row, validates available subscription seats, sets status `INVITED`, generates a new 256-bit cryptographically secure single-use token and 7-day expiration, and dispatches the invitation email.
+- **Authentication**: `Bearer <JWT>`
+- **Authorization**: `OWNER` or `ADMIN`.
+- **Response (200 OK)**:
+  ```json
+  {
+    "message": "Agent re-invited successfully",
+    "user": {
+      "id": "uuid-v4",
+      "email": "agent@acme.com",
+      "role": "AGENT",
+      "status": "INVITED",
+      "invitationExpiresAt": "2026-11-09T10:00:00.000Z"
+    },
+    "invitationUrl": "https://app.supportos.dev/invite/64-char-raw-entropy-hex",
+    "emailDelivery": {
+      "acceptedByProvider": true,
+      "status": "SENT",
+      "provider": "SMTP",
+      "deliveryNote": "Accepted by SMTP transport for queuing/dispatch. Inbox delivery is subject to recipient mail server acceptance."
+    }
+  }
+  ```
 
 ---
 

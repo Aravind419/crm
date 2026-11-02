@@ -145,7 +145,9 @@ export interface BusinessHoursPayload {
 const TIME_REGEX = /^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$/;
 
 /**
- * Validates weekly business hours structure, day names, 24-hr time format, and start < end.
+ * Validates weekly business hours structure, requiring exactly the seven weekday identifiers,
+ * boolean enabled flags, valid 24-hr time formats, start < end for operational days,
+ * and consistent normalization for non-operational days.
  */
 export function validateBusinessHours(input: unknown): { valid: boolean; data?: any; error?: string } {
   if (input === undefined || input === null) {
@@ -161,8 +163,16 @@ export function validateBusinessHours(input: unknown): { valid: boolean; data?: 
     }
   }
 
-  if (typeof hoursObj !== 'object' || hoursObj === null) {
+  if (typeof hoursObj !== 'object' || hoursObj === null || Array.isArray(hoursObj)) {
     return { valid: false, error: 'businessHours must be a structured object' };
+  }
+
+  // Validate allowed top-level keys
+  const allowedKeys = ['timezone', 'schedule'];
+  for (const k of Object.keys(hoursObj)) {
+    if (!allowedKeys.includes(k)) {
+      return { valid: false, error: `businessHours contains unrecognized field "${k}"` };
+    }
   }
 
   // Validate timezone in business hours if specified
@@ -172,49 +182,93 @@ export function validateBusinessHours(input: unknown): { valid: boolean; data?: 
     }
   }
 
-  if (!hoursObj.schedule || typeof hoursObj.schedule !== 'object') {
+  if (!hoursObj.schedule || typeof hoursObj.schedule !== 'object' || Array.isArray(hoursObj.schedule)) {
     return { valid: false, error: 'businessHours must contain a "schedule" object defining weekly operational days' };
   }
 
   const schedule = hoursObj.schedule;
+  const scheduleKeys = Object.keys(schedule).map((k) => k.toLowerCase());
+
+  // Must reject empty schedules
+  if (scheduleKeys.length === 0) {
+    return { valid: false, error: 'businessHours schedule cannot be empty; exactly all seven weekdays are required' };
+  }
+
+  // Require exactly the seven supported weekday identifiers
+  for (const day of VALID_DAYS) {
+    if (!scheduleKeys.includes(day)) {
+      return {
+        valid: false,
+        error: `businessHours schedule must contain all seven weekdays; missing operational day "${day}"`,
+      };
+    }
+  }
+
+  // Reject unexpected day keys
+  for (const key of Object.keys(schedule)) {
+    if (!VALID_DAYS.includes(key.toLowerCase() as ValidDay)) {
+      return { valid: false, error: `Invalid day identifier "${key}" in business hours schedule` };
+    }
+  }
+
   const normalizedSchedule: Record<string, { enabled: boolean; start: string; end: string }> = {};
 
-  for (const [dayKey, dayCfgRaw] of Object.entries(schedule)) {
-    const day = dayKey.toLowerCase();
-    if (!VALID_DAYS.includes(day as ValidDay)) {
-      return { valid: false, error: `Invalid day identifier "${dayKey}" in business hours schedule` };
+  for (const day of VALID_DAYS) {
+    const rawKey = Object.keys(schedule).find((k) => k.toLowerCase() === day) || day;
+    const dayCfg = schedule[rawKey];
+
+    if (typeof dayCfg !== 'object' || dayCfg === null || Array.isArray(dayCfg)) {
+      return { valid: false, error: `Day configuration for "${day}" must be an object` };
     }
 
-    const dayCfg = dayCfgRaw as any;
-    if (typeof dayCfg !== 'object' || dayCfg === null) {
-      return { valid: false, error: `Day configuration for "${dayKey}" must be an object` };
+    if (typeof dayCfg.enabled !== 'boolean') {
+      return { valid: false, error: `Field "enabled" must be an actual boolean for day "${day}"` };
     }
 
-    const enabled = Boolean(dayCfg.enabled);
-    if (enabled) {
+    if (dayCfg.enabled) {
       if (!dayCfg.start || typeof dayCfg.start !== 'string' || !TIME_REGEX.test(dayCfg.start.trim())) {
-        return { valid: false, error: `Invalid start time format for ${dayKey}: must be 24-hour HH:MM (e.g. 09:00)` };
+        return { valid: false, error: `Invalid start time format for ${day}: must be 24-hour HH:MM (e.g. 09:00)` };
       }
       if (!dayCfg.end || typeof dayCfg.end !== 'string' || !TIME_REGEX.test(dayCfg.end.trim())) {
-        return { valid: false, error: `Invalid end time format for ${dayKey}: must be 24-hour HH:MM (e.g. 17:00)` };
+        return { valid: false, error: `Invalid end time format for ${day}: must be 24-hour HH:MM (e.g. 17:00)` };
       }
 
       const start = dayCfg.start.trim();
       const end = dayCfg.end.trim();
 
-      if (start >= end) {
+      if (start === end) {
         return {
           valid: false,
-          error: `Start time (${start}) must precede end time (${end}) for operational day ${dayKey}`,
+          error: `Start time (${start}) and end time (${end}) cannot be equal for operational day ${day}`,
+        };
+      }
+
+      if (start > end) {
+        return {
+          valid: false,
+          error: `Start time (${start}) must precede end time (${end}) for operational day ${day}`,
         };
       }
 
       normalizedSchedule[day] = { enabled: true, start, end };
     } else {
+      // Validate start/end if optionally provided on disabled day
+      if (dayCfg.start !== undefined && dayCfg.start !== null) {
+        if (typeof dayCfg.start !== 'string' || !TIME_REGEX.test(dayCfg.start.trim())) {
+          return { valid: false, error: `Invalid start time format for disabled day ${day}` };
+        }
+      }
+      if (dayCfg.end !== undefined && dayCfg.end !== null) {
+        if (typeof dayCfg.end !== 'string' || !TIME_REGEX.test(dayCfg.end.trim())) {
+          return { valid: false, error: `Invalid end time format for disabled day ${day}` };
+        }
+      }
+
+      // Consistent representation for disabled days
       normalizedSchedule[day] = {
         enabled: false,
-        start: dayCfg.start && typeof dayCfg.start === 'string' && TIME_REGEX.test(dayCfg.start.trim()) ? dayCfg.start.trim() : '09:00',
-        end: dayCfg.end && typeof dayCfg.end === 'string' && TIME_REGEX.test(dayCfg.end.trim()) ? dayCfg.end.trim() : '17:00',
+        start: '00:00',
+        end: '00:00',
       };
     }
   }

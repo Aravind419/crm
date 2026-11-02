@@ -612,13 +612,33 @@ async function runOnboardingAdministrationSuite() {
     const rotatedToken = resendRes.data.invitationUrl.split('/invite/')[1];
     assert.notStrictEqual(initialExtraToken, rotatedToken, 'Resending invitation must rotate the single-use token');
 
-    // Revoke invitation
+    // Revoke invitation: record retained with status='DEACTIVATED', token hash cleared
     const revokeRes = await request({
       method: 'DELETE',
       path: `/api/v1/users/${extraUserId}/invitation`,
       headers: ownerHeaders,
     });
     assert.strictEqual(revokeRes.status, 200);
+
+    // Verify user record retained in database with DEACTIVATED status
+    const revokedUserDb = await prisma.user.findUnique({ where: { id: extraUserId } });
+    assert.ok(revokedUserDb, 'Revoked user record must be retained in DB, not deleted');
+    assert.strictEqual(revokedUserDb.status, 'DEACTIVATED', 'User status must transition to DEACTIVATED');
+    assert.strictEqual(revokedUserDb.invitationTokenHash, null, 'Invitation token hash must be cleared');
+    assert.strictEqual(revokedUserDb.invitationExpiresAt, null, 'Invitation expiry must be cleared');
+
+    // Verify audit trail recorded revocation
+    const revokeAudit = await prisma.auditEvent.findFirst({
+      where: { entityId: extraUserId, action: 'INVITATION_REVOKED' },
+    });
+    assert.ok(revokeAudit, 'Audit event INVITATION_REVOKED must be preserved');
+
+    // Attempt to inspect revoked invitation must fail with 404
+    const inspectRevokedRes = await request({
+      method: 'GET',
+      path: `/api/v1/auth/invitations/${rotatedToken}`,
+    });
+    assert.strictEqual(inspectRevokedRes.status, 404, 'Revoked invitation token must no longer be inspectable');
 
     // Attempt to accept revoked invitation must fail with 404
     const acceptRevokedRes = await request({
@@ -632,7 +652,43 @@ async function runOnboardingAdministrationSuite() {
       },
     });
     assert.strictEqual(acceptRevokedRes.status, 404, 'Revoked invitation must not be accepted');
-    console.log('   ✅ Invitation resend rotated token and revocation canceled pending access');
+
+    // Resend on revoked user must be blocked (explicit re-invitation workflow required)
+    const blockedResendRes = await request({
+      method: 'POST',
+      path: `/api/v1/users/${extraUserId}/invitation/resend`,
+      headers: ownerHeaders,
+    });
+    assert.strictEqual(blockedResendRes.status, 400, 'Resend on revoked invitation must be rejected with 400');
+
+    // Explicit re-invitation workflow
+    const reinviteRes = await request({
+      method: 'POST',
+      path: `/api/v1/users/${extraUserId}/invitation/reinvite`,
+      headers: ownerHeaders,
+    });
+    assert.strictEqual(reinviteRes.status, 200, 'Explicit re-invitation must succeed');
+    assert.ok(reinviteRes.data.invitationUrl, 'Expected new invitation URL');
+    const reinvitedToken = reinviteRes.data.invitationUrl.split('/invite/')[1];
+
+    const reinvitedUserDb = await prisma.user.findUnique({ where: { id: extraUserId } });
+    assert.strictEqual(reinvitedUserDb?.status, 'INVITED', 'Re-invited user must transition back to INVITED');
+    assert.ok(reinvitedUserDb?.invitationTokenHash, 'New invitation token hash must be set');
+
+    // Verify accepting the re-invited token succeeds
+    const acceptReinvitedRes = await request({
+      method: 'POST',
+      path: '/api/v1/auth/invitations/accept',
+      body: {
+        token: reinvitedToken,
+        firstName: 'Reinvited',
+        lastName: 'Agent',
+        password: 'ReinvitedPassword123!Secure',
+      },
+    });
+    assert.strictEqual(acceptReinvitedRes.status, 200, 'Accepting re-invited token must succeed');
+
+    console.log('   ✅ Complete invitation lifecycle verified: revocation retains record in DEACTIVATED state with audit trail, blocks resend/inspection/acceptance, and explicit re-invitation workflow succeeds');
 
     // ------------------------------------------------------------------------
     // Scenario 16: Cross-Tenant Isolation Verification
@@ -877,7 +933,40 @@ async function runOnboardingAdministrationSuite() {
     });
     assert.strictEqual(badDomainRes.status, 400);
 
-    // G. Business hours validation: invalid day
+    // G. Business hours validation: empty schedule
+    const emptyScheduleRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: {
+        businessHours: { timezone: 'UTC', schedule: {} },
+      },
+    });
+    assert.strictEqual(emptyScheduleRes.status, 400);
+
+    // H. Business hours validation: missing weekdays (only 6 days)
+    const missingDaysRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: {
+        businessHours: {
+          timezone: 'UTC',
+          schedule: {
+            monday: { enabled: true, start: '09:00', end: '17:00' },
+            tuesday: { enabled: true, start: '09:00', end: '17:00' },
+            wednesday: { enabled: true, start: '09:00', end: '17:00' },
+            thursday: { enabled: true, start: '09:00', end: '17:00' },
+            friday: { enabled: true, start: '09:00', end: '17:00' },
+            saturday: { enabled: false },
+            // missing sunday!
+          },
+        },
+      },
+    });
+    assert.strictEqual(missingDaysRes.status, 400);
+
+    // I. Business hours validation: invalid day identifier
     const badDayRes = await request({
       method: 'PATCH',
       path: '/api/v1/organizations/current',
@@ -893,7 +982,73 @@ async function runOnboardingAdministrationSuite() {
     });
     assert.strictEqual(badDayRes.status, 400);
 
-    // H. Business hours validation: inverted start and end time
+    // J. Business hours validation: invalid boolean for enabled
+    const badBoolRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: {
+        businessHours: {
+          timezone: 'UTC',
+          schedule: {
+            monday: { enabled: 'yes', start: '09:00', end: '17:00' },
+            tuesday: { enabled: false },
+            wednesday: { enabled: false },
+            thursday: { enabled: false },
+            friday: { enabled: false },
+            saturday: { enabled: false },
+            sunday: { enabled: false },
+          },
+        },
+      },
+    });
+    assert.strictEqual(badBoolRes.status, 400);
+
+    // K. Business hours validation: invalid time format
+    const badTimeFormatRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: {
+        businessHours: {
+          timezone: 'UTC',
+          schedule: {
+            monday: { enabled: true, start: '9:00', end: '17:00' },
+            tuesday: { enabled: false },
+            wednesday: { enabled: false },
+            thursday: { enabled: false },
+            friday: { enabled: false },
+            saturday: { enabled: false },
+            sunday: { enabled: false },
+          },
+        },
+      },
+    });
+    assert.strictEqual(badTimeFormatRes.status, 400);
+
+    // L. Business hours validation: equal start and end times
+    const equalTimesRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: {
+        businessHours: {
+          timezone: 'UTC',
+          schedule: {
+            monday: { enabled: true, start: '09:00', end: '09:00' },
+            tuesday: { enabled: false },
+            wednesday: { enabled: false },
+            thursday: { enabled: false },
+            friday: { enabled: false },
+            saturday: { enabled: false },
+            sunday: { enabled: false },
+          },
+        },
+      },
+    });
+    assert.strictEqual(equalTimesRes.status, 400);
+
+    // M. Business hours validation: inverted start and end time
     const badHoursInverted = await request({
       method: 'PATCH',
       path: '/api/v1/organizations/current',
@@ -903,12 +1058,18 @@ async function runOnboardingAdministrationSuite() {
           timezone: 'UTC',
           schedule: {
             monday: { enabled: true, start: '18:00', end: '09:00' },
+            tuesday: { enabled: false },
+            wednesday: { enabled: false },
+            thursday: { enabled: false },
+            friday: { enabled: false },
+            saturday: { enabled: false },
+            sunday: { enabled: false },
           },
         },
       },
     });
     assert.strictEqual(badHoursInverted.status, 400);
-    assert.ok(badHoursInverted.data.message.includes('precede'));
+    assert.ok(badHoursInverted.data.message.includes('precede') || badHoursInverted.data.message.includes('equal'));
 
     // I. Premature onboarding completion rejection without required fields
     const emptyOrgSignup = await request({
@@ -963,7 +1124,123 @@ async function runOnboardingAdministrationSuite() {
     assert.strictEqual(conflictDups.length, 1, `Second duplicate invite must receive 409 Conflict, got ${conflictDups.length}`);
     console.log('   ✅ Concurrent duplicate invites safely handled: 1 created (201), 1 conflict (409), 0 unhandled 500s');
 
-    console.log('\n🎉 ALL PHASE 1 & PHASE 1.1 ONBOARDING & ADMINISTRATION TESTS PASSED SUCCESSFULLY!');
+    // ------------------------------------------------------------------------
+    // Scenario 22: Concurrent Invitation Seat Quota Enforcement
+    // ------------------------------------------------------------------------
+    console.log('\n22. Testing Concurrent Invitation Seat Limit Serialization & Race Defense...');
+    // Create an organization on the FREE plan (maxAgents: 2)
+    const freeOrgSuffix = Math.random().toString(36).substring(2, 8);
+    const freeOrgSignup = await request({
+      method: 'POST',
+      path: '/api/v1/auth/signup',
+      body: {
+        orgName: `Free Tier Limits ${freeOrgSuffix}`,
+        firstName: 'Free',
+        lastName: 'Owner',
+        email: `free.owner.${freeOrgSuffix}@test.com`,
+        password: 'Password123!Secure',
+      },
+    });
+    assert.strictEqual(freeOrgSignup.status, 201);
+    const freeOrgHeaders = { Authorization: `Bearer ${freeOrgSignup.data.token}` };
+    const freeOrgId = freeOrgSignup.data.organization.id;
+    createdOrgIds.push(freeOrgId);
+
+    // Downgrade organization plan to FREE explicitly (max 2 agents)
+    await prisma.organization.update({
+      where: { id: freeOrgId },
+      data: { plan: 'FREE' },
+    });
+
+    // Currently 1 owner exists in DB. Exactly 1 additional agent seat is available!
+    // Dispatch 4 simultaneous concurrent invite requests with distinct emails:
+    const invitePromises = [1, 2, 3, 4].map((i) =>
+      request({
+        method: 'POST',
+        path: '/api/v1/users/invite',
+        headers: freeOrgHeaders,
+        body: {
+          email: `concurrent.seat.${i}.${freeOrgSuffix}@test.com`,
+          role: 'AGENT',
+        },
+      })
+    );
+
+    const seatResults = await Promise.all(invitePromises);
+    const seatSuccesses = seatResults.filter((r) => r.status === 201);
+    const seatExceeded = seatResults.filter((r) => r.status === 403);
+
+    // Exactly 1 request may succeed, and 3 must be blocked with 403
+    assert.strictEqual(
+      seatSuccesses.length,
+      1,
+      `Expected exactly 1 concurrent invite to succeed within remaining seat capacity, got ${seatSuccesses.length}`
+    );
+    assert.strictEqual(
+      seatExceeded.length,
+      3,
+      `Expected exactly 3 concurrent invites to be rejected with 403 seat limit reached, got ${seatExceeded.length}`
+    );
+
+    // Verify DB count: strictly 2 agents in ACTIVE or INVITED status
+    const finalFreeOrgUserCount = await prisma.user.count({
+      where: {
+        organizationId: freeOrgId,
+        status: { in: ['ACTIVE', 'INVITED'] },
+      },
+    });
+    assert.strictEqual(
+      finalFreeOrgUserCount,
+      2,
+      `Database total seat count must never exceed plan limit (2), got ${finalFreeOrgUserCount}`
+    );
+    console.log('   ✅ Seat quota serialization verified: under concurrency, exactly 1 seat allocated, 3 blocked with 403, DB quota strictly preserved at 2');
+
+    // ------------------------------------------------------------------------
+    // Scenario 23: Email Delivery Semantics & Secret Sanitization Matrix
+    // ------------------------------------------------------------------------
+    console.log('\n23. Testing Email Delivery Semantics, Acceptance vs Delivery, & Secret Sanitization...');
+    // A. Explicit acceptance semantics vs mailbox delivery
+    const inviteDeliveryCheck = await request({
+      method: 'POST',
+      path: '/api/v1/users/invite',
+      headers: ownerHeaders,
+      body: {
+        email: `semantics.check.${orgSuffix}@test.com`,
+        role: 'AGENT',
+      },
+    });
+    assert.strictEqual(inviteDeliveryCheck.status, 201);
+    const deliveryMeta = inviteDeliveryCheck.data.emailDelivery;
+    assert.ok(deliveryMeta, 'Expected emailDelivery payload');
+    assert.strictEqual(typeof deliveryMeta.acceptedByProvider, 'boolean', 'Expected acceptedByProvider boolean');
+    assert.ok(['SENT', 'BLOCKED_MISSING_CREDENTIALS', 'FAILED'].includes(deliveryMeta.status));
+    assert.ok(deliveryMeta.deliveryNote, 'Expected explicit deliveryNote detailing provider acceptance semantics');
+
+    // B. Secret sanitization verification
+    const { sanitizeEmailError } = await import('../src/services/email.service');
+    const sensitiveLog = 'Error connecting to smtp://admin:superSecretPassword123@smtp.mail.com with key re_1234567890abcdef1234567890';
+    const sanitizedLog = sanitizeEmailError(sensitiveLog);
+    assert.ok(!sanitizedLog.includes('superSecretPassword123'), 'Sensitive password must be scrubbed');
+    assert.ok(!sanitizedLog.includes('re_1234567890abcdef1234567890'), 'Resend API key must be redacted');
+    assert.ok(sanitizedLog.includes('[REDACTED]'), 'Expected redacted placeholder');
+
+    // C. Malformed URL rejection in EmailService
+    const badUrlTest = await EmailService.sendInvitation({
+      to: 'agent@test.com',
+      recipientName: 'Agent',
+      inviterName: 'Owner',
+      organizationName: 'Test Org',
+      role: 'AGENT',
+      invitationUrl: 'javascript:alert(1)',
+      expiresAt: new Date(),
+    });
+    assert.strictEqual(badUrlTest.status, 'FAILED');
+    assert.strictEqual(badUrlTest.acceptedByProvider, false);
+    assert.ok(badUrlTest.error?.includes('Invalid invitation URL origin'));
+    console.log('   ✅ Email delivery semantics verified: provider acceptance separated from inbox delivery, secrets sanitized, invalid URLs safely rejected');
+
+    console.log('\n🎉 ALL PHASE 1, 1.1 & 1.2 ONBOARDING & ADMINISTRATION TESTS PASSED SUCCESSFULLY!');
   } finally {
     try {
       const { closeSocketService } = await import('../src/services/socket.service');

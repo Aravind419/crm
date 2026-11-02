@@ -48,8 +48,9 @@ export class EntitlementService {
   /**
    * Retrieves subscription tier and feature limits for an organization.
    */
-  static async getPlanLimits(organizationId: string): Promise<{ plan: string; limits: PlanLimits }> {
-    const org = await prisma.organization.findUnique({
+  static async getPlanLimits(organizationId: string, tx?: any): Promise<{ plan: string; limits: PlanLimits }> {
+    const client = tx || prisma;
+    const org = await client.organization.findUnique({
       where: { id: organizationId },
       select: { plan: true },
     });
@@ -62,9 +63,10 @@ export class EntitlementService {
   /**
    * Asserts whether an organization can add another agent.
    */
-  static async canAddAgent(organizationId: string): Promise<{ allowed: boolean; current: number; max: number; plan: string }> {
-    const { plan, limits } = await this.getPlanLimits(organizationId);
-    const current = await prisma.user.count({
+  static async canAddAgent(organizationId: string, tx?: any): Promise<{ allowed: boolean; current: number; max: number; plan: string }> {
+    const client = tx || prisma;
+    const { plan, limits } = await this.getPlanLimits(organizationId, client);
+    const current = await client.user.count({
       where: { organizationId, status: { in: ['ACTIVE', 'INVITED'] } },
     });
 

@@ -13,11 +13,18 @@ export interface SendInvitationEmailParams {
 }
 
 export interface EmailDeliveryResult {
-  delivered: boolean;
+  /**
+   * Indicates whether the upstream email provider (SMTP server or Resend API) accepted the message.
+   * NOTE: Provider acceptance does NOT guarantee mailbox delivery, which is subject to recipient MTA,
+   * spam filtering, DMARC/SPF/DKIM policies, and recipient inbox status.
+   */
+  acceptedByProvider: boolean;
+  delivered: boolean; // Retained for backwards compatibility; mirrors acceptedByProvider
   status: 'SENT' | 'BLOCKED_MISSING_CREDENTIALS' | 'FAILED';
   provider?: string;
   messageId?: string;
   error?: string;
+  deliveryNote?: string;
 }
 
 /**
@@ -67,7 +74,11 @@ export function sanitizeEmailError(rawError: unknown): string {
   const msg = typeof rawError === 'string' ? rawError : (rawError as any).message || String(rawError);
 
   return msg
-    .replace(/(?:password|pass|secret|api[_-]?key|bearer)[\s:=]+([^\s,;]+)/gi, '$1=[REDACTED]')
+    // Redact URI user:password credentials: e.g. smtp://user:secret@host -> smtp://user:[REDACTED]@host
+    .replace(/(:\/\/[^:]+:)([^@\s]+)(@)/gi, '$1[REDACTED]$3')
+    // Redact password/secret/api_key key-values: e.g. password=secret -> password=[REDACTED]
+    .replace(/(password|pass|secret|api[_-]?key|bearer)([\s:=]+)([^\s,;]+)/gi, '$1$2[REDACTED]')
+    // Redact Resend API keys: e.g. re_...
     .replace(/(re_[a-zA-Z0-9_-]{20,})/gi, '[REDACTED_API_KEY]')
     .replace(/([a-zA-Z0-9_\-\.]{25,})/g, (token: string) => {
       if (/^[a-f0-9]{64}$/i.test(token)) return token; // Keep invitation token format readable
@@ -146,9 +157,11 @@ export class EmailService {
       const err = `Invalid invitation URL origin or format: ${params.invitationUrl}`;
       console.error(`[Email Service Security Error] Refusing to dispatch email with untrusted URL: ${params.invitationUrl}`);
       return {
+        acceptedByProvider: false,
         delivered: false,
         status: 'FAILED',
         error: err,
+        deliveryNote: 'Security check rejected untrusted or malformed invitation URL origin/pattern.',
       };
     }
 
@@ -159,9 +172,11 @@ export class EmailService {
         'Email delivery blocked: No real SMTP or Resend credentials configured (missing SMTP_HOST/SMTP_USER or RESEND_API_KEY). Delivery cannot be performed.';
       console.warn(`[Email Service Blocked] Invitation email to ${params.to} could not be sent. Real email credentials are missing.`);
       return {
+        acceptedByProvider: false,
         delivered: false,
         status: 'BLOCKED_MISSING_CREDENTIALS',
         error: blockedMsg,
+        deliveryNote: 'Provider credentials are unconfigured. The invitation was not transmitted to any mail transport.',
       };
     }
 
@@ -188,10 +203,12 @@ export class EmailService {
         });
 
         return {
+          acceptedByProvider: true,
           delivered: true,
           status: 'SENT',
           provider: 'SMTP',
           messageId: info.messageId,
+          deliveryNote: 'Accepted by SMTP transport for queuing/dispatch. Inbox delivery is subject to recipient mail server acceptance.',
         };
       }
 
@@ -217,25 +234,31 @@ export class EmailService {
 
         const data: any = await res.json();
         return {
+          acceptedByProvider: true,
           delivered: true,
           status: 'SENT',
           provider: 'RESEND',
           messageId: data.id,
+          deliveryNote: 'Accepted by Resend API for delivery. Final mailbox receipt depends on recipient MTA and reputation policies.',
         };
       }
 
       return {
+        acceptedByProvider: false,
         delivered: false,
         status: 'BLOCKED_MISSING_CREDENTIALS',
         error: 'No active email transport configured',
+        deliveryNote: 'No active email transport configured.',
       };
     } catch (sendErr: any) {
       const sanitized = sanitizeEmailError(sendErr);
       console.error(`[Email Service Delivery Failed] Error sending to ${params.to}:`, sanitized);
       return {
+        acceptedByProvider: false,
         delivered: false,
         status: 'FAILED',
         error: `Email delivery failed: ${sanitized}`,
+        deliveryNote: 'Upstream mail provider rejected the delivery request or threw an error.',
       };
     }
   }
