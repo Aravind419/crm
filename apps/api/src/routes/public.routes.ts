@@ -45,50 +45,49 @@ export async function verifyVisitorSession(
     };
   }
 
+  if (!conversationId || typeof conversationId !== 'string' || !conversationId.trim()) {
+    return {
+      valid: false,
+      statusCode: 403,
+      error: 'Valid conversation ID binding required.',
+    };
+  }
+
   const tokenHash = crypto.createHash('sha256').update(rawToken.trim()).digest('hex');
 
-  // Query database for authoritative VisitorSession record
+  // Query database strictly for authoritative VisitorSession record by tokenHash
   const session = await prisma.visitorSession.findFirst({
     where: { tokenHash },
-    include: {
-      conversation: true,
-      customer: true,
+    select: {
+      id: true,
+      conversationId: true,
+      expiresAt: true,
+      revokedAt: true,
     },
   });
 
-  if (session) {
-    if (session.revokedAt) {
-      return { valid: false, statusCode: 403, error: 'Visitor session has been revoked' };
-    }
-    if (session.expiresAt < new Date()) {
-      return { valid: false, statusCode: 403, error: 'Visitor session expired' };
-    }
-    if (session.conversationId && session.conversationId !== conversationId) {
-      return { valid: false, statusCode: 403, error: 'Visitor session does not match requested conversation' };
-    }
-    return { valid: true, statusCode: 200 };
+  if (!session) {
+    return {
+      valid: false,
+      statusCode: 403,
+      error: 'Invalid visitor session token. Unauthorized conversation access prohibited.',
+    };
   }
 
-  // Fallback: Check for customAttributes token on the customer record
-  const conversation = await prisma.conversation.findUnique({
-    where: { id: conversationId },
-    include: { customer: true },
-  });
-
-  if (conversation?.customer?.customAttributes) {
-    try {
-      const attrs = JSON.parse(conversation.customer.customAttributes);
-      if (attrs.visitorToken === rawToken.trim()) {
-        return { valid: true, statusCode: 200 };
-      }
-    } catch (e) {}
+  if (session.revokedAt) {
+    return { valid: false, statusCode: 403, error: 'Visitor session has been revoked' };
   }
 
-  return {
-    valid: false,
-    statusCode: 403,
-    error: 'Invalid visitor session token. Unauthorized conversation access prohibited.',
-  };
+  if (session.expiresAt < new Date()) {
+    return { valid: false, statusCode: 403, error: 'Visitor session expired' };
+  }
+
+  // Exact conversation ID matching: null or mismatched conversationId strictly denied
+  if (!session.conversationId || session.conversationId !== conversationId.trim()) {
+    return { valid: false, statusCode: 403, error: 'Visitor session does not match requested conversation' };
+  }
+
+  return { valid: true, statusCode: 200 };
 }
 
 /**
@@ -157,11 +156,8 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
     const customerEmail = email ? String(email).toLowerCase().trim() : null;
     const customerName = (name && String(name).trim()) || 'Website Visitor';
 
-    // Generate cryptographic 256-bit visitor token if not provided
-    const safeVisitorToken = visitorToken && typeof visitorToken === 'string' && visitorToken.trim().length >= 16
-      ? visitorToken.trim()
-      : `vst_${crypto.randomBytes(32).toString('hex')}`;
-
+    // Server-enforced cryptographic 256-bit visitor token generation
+    const safeVisitorToken = `vst_${crypto.randomBytes(32).toString('hex')}`;
     const tokenHash = crypto.createHash('sha256').update(safeVisitorToken).digest('hex');
     const sessionExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
 
@@ -181,7 +177,6 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
             email: customerEmail,
             customAttributes: JSON.stringify({
               source: 'Website Widget',
-              visitorToken: safeVisitorToken,
               userAgent: req.headers['user-agent'] || 'unknown',
             }),
           },
@@ -189,7 +184,7 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
       } else {
         try {
           const existingAttrs = customer.customAttributes ? JSON.parse(customer.customAttributes) : {};
-          existingAttrs.visitorToken = safeVisitorToken;
+          delete existingAttrs.visitorToken; // Scrub any legacy token
           await tx.customer.update({
             where: { id: customer.id },
             data: { customAttributes: JSON.stringify(existingAttrs) },

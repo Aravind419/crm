@@ -4,17 +4,19 @@ import * as crypto from 'crypto';
 import { io as ClientIO } from 'socket.io-client';
 import { app, server } from '../src/server';
 import { prisma } from '../src/prisma';
+import { config } from '../src/config';
 
-const TEST_PORT = 4997;
+const TEST_PORT = 4996;
 
 function request(options: {
   method: string;
   path: string;
   headers?: Record<string, string>;
   body?: any;
+  rawBody?: Buffer;
 }): Promise<{ status: number; data: any }> {
   return new Promise((resolve, reject) => {
-    const payload = options.body ? JSON.stringify(options.body) : undefined;
+    const payload = options.rawBody || (options.body ? Buffer.from(JSON.stringify(options.body)) : undefined);
     const req = http.request(
       {
         hostname: 'localhost',
@@ -23,7 +25,7 @@ function request(options: {
         method: options.method,
         headers: {
           'Content-Type': 'application/json',
-          ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
+          ...(payload ? { 'Content-Length': payload.length } : {}),
           ...options.headers,
         },
       },
@@ -49,7 +51,7 @@ function request(options: {
 }
 
 async function runSecurityRemediationSuite() {
-  console.log('🛡️ Starting SupportOS 14-Point Comprehensive Security Verification Suite...\n');
+  console.log('🛡️ Starting SupportOS Rigorous Comprehensive Security Verification Suite...\n');
 
   await new Promise<void>((resolve) => {
     server.listen(TEST_PORT, () => {
@@ -58,8 +60,11 @@ async function runSecurityRemediationSuite() {
     });
   });
 
+  const createdSessionIds: string[] = [];
+  const createdUserIds: string[] = [];
+
   try {
-    // 0. Setup: Authenticate Org A (Alex Acme) & Org B (Sarah Starlight)
+    // 0. Setup: Authenticate Org A (Alex Acme) & Org B (Maya Starlight)
     const loginA = await request({
       method: 'POST',
       path: '/api/v1/auth/login',
@@ -79,7 +84,7 @@ async function runSecurityRemediationSuite() {
     const headersB = { Authorization: `Bearer ${tokenB}` };
     const agentBId = loginB.data.user.id;
 
-    // Retrieve or create Org A conversation
+    // Retrieve Org A conversation
     const convARes = await request({
       method: 'GET',
       path: '/api/v1/conversations',
@@ -89,7 +94,7 @@ async function runSecurityRemediationSuite() {
     const convA = convARes.data.conversations[0];
     assert.ok(convA, 'Org A must have at least one seeded conversation');
 
-    // Retrieve or create Org B conversation
+    // Retrieve Org B conversation
     const convBRes = await request({
       method: 'GET',
       path: '/api/v1/conversations',
@@ -114,7 +119,7 @@ async function runSecurityRemediationSuite() {
     });
     const ticketB = ticketBRes.data.tickets[0];
 
-    // Seed Visitor Session for Public Tests
+    // Seed Isolated Visitor Session for Public Tests
     const visitorRawToken = `vst_audit_${crypto.randomBytes(24).toString('hex')}`;
     const visitorTokenHash = crypto.createHash('sha256').update(visitorRawToken).digest('hex');
 
@@ -127,8 +132,9 @@ async function runSecurityRemediationSuite() {
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
       },
     });
+    createdSessionIds.push(visitorSession.id);
 
-    console.log('--- TEST CASES 1-6: PUBLIC VISITOR AUTHENTICATION & IDOR DEFENSES ---');
+    console.log('--- SECTION 1: VISITOR SESSION AUTHENTICATION & IDOR DEFENSES ---');
 
     // Test 1: Public read denied without visitor token
     console.log('1. Testing: Public read denied without visitor token...');
@@ -152,10 +158,9 @@ async function runSecurityRemediationSuite() {
 
     // Test 3: Public read denied for expired visitor token
     console.log('3. Testing: Public read denied for expired visitor token...');
-    // Create an expired visitor token
     const expiredToken = `vst_expired_${crypto.randomBytes(20).toString('hex')}`;
     const expiredHash = crypto.createHash('sha256').update(expiredToken).digest('hex');
-    await prisma.visitorSession.create({
+    const expiredSession = await prisma.visitorSession.create({
       data: {
         inboxId: convA.inboxId,
         customerId: convA.customerId,
@@ -164,6 +169,8 @@ async function runSecurityRemediationSuite() {
         expiresAt: new Date(Date.now() - 60 * 1000), // Expired 1 minute ago
       },
     });
+    createdSessionIds.push(expiredSession.id);
+
     const test3 = await request({
       method: 'GET',
       path: `/api/v1/public/conversations/${convA.id}`,
@@ -172,98 +179,162 @@ async function runSecurityRemediationSuite() {
     assert.strictEqual(test3.status, 403, 'Expired visitor token must be HTTP 403');
     console.log('   ✅ PASS: Public read denied for expired visitor token (HTTP 403)');
 
-    // Test 4: Public write denied without visitor token
-    console.log('4. Testing: Public write denied without visitor token...');
+    // Test 4: Public read denied for revoked visitor token
+    console.log('4. Testing: Public read denied for revoked visitor token...');
+    const revokedToken = `vst_revoked_${crypto.randomBytes(20).toString('hex')}`;
+    const revokedHash = crypto.createHash('sha256').update(revokedToken).digest('hex');
+    const revokedSession = await prisma.visitorSession.create({
+      data: {
+        inboxId: convA.inboxId,
+        customerId: convA.customerId,
+        conversationId: convA.id,
+        tokenHash: revokedHash,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        revokedAt: new Date(), // Revoked immediately
+      },
+    });
+    createdSessionIds.push(revokedSession.id);
+
     const test4 = await request({
+      method: 'GET',
+      path: `/api/v1/public/conversations/${convA.id}`,
+      headers: { 'x-visitor-token': revokedToken },
+    });
+    assert.strictEqual(test4.status, 403, 'Revoked visitor token must be HTTP 403');
+    console.log('   ✅ PASS: Public read denied for revoked visitor token (HTTP 403)');
+
+    // Test 5: Legacy plaintext token stored in customer.customAttributes cannot authenticate
+    console.log('5. Testing: Legacy plaintext token in customer.customAttributes rejected (no fallback)...');
+    const legacyPlaintextToken = `legacy_plain_${crypto.randomBytes(16).toString('hex')}`;
+    // Inject into customer custom attributes
+    await prisma.customer.update({
+      where: { id: convA.customerId },
+      data: { customAttributes: JSON.stringify({ visitorToken: legacyPlaintextToken }) },
+    });
+
+    const test5 = await request({
+      method: 'GET',
+      path: `/api/v1/public/conversations/${convA.id}`,
+      headers: { 'x-visitor-token': legacyPlaintextToken },
+    });
+    assert.strictEqual(test5.status, 403, 'Plaintext token in customAttributes must be rejected with 403');
+    console.log('   ✅ PASS: Legacy plaintext token rejected without SHA-256 VisitorSession record (HTTP 403)');
+
+    // Test 6: Public write denied without visitor token
+    console.log('6. Testing: Public write denied without visitor token...');
+    const test6 = await request({
       method: 'POST',
       path: `/api/v1/public/conversations/${convA.id}/messages`,
       body: { message: 'Attempt unauthorized visitor post' },
     });
-    assert.strictEqual(test4.status, 403, 'Public write without token must be HTTP 403');
+    assert.strictEqual(test6.status, 403, 'Public write without token must be HTTP 403');
     console.log('   ✅ PASS: Public write denied without visitor token (HTTP 403)');
 
-    // Test 5: Public write denied for invalid visitor token
-    console.log('5. Testing: Public write denied for invalid visitor token...');
-    const test5 = await request({
+    // Test 7: Public write denied for invalid visitor token
+    console.log('7. Testing: Public write denied for invalid visitor token...');
+    const test7 = await request({
       method: 'POST',
       path: `/api/v1/public/conversations/${convA.id}/messages`,
       headers: { 'x-visitor-token': 'invalid_forged_random_token_12345' },
       body: { message: 'Forged visitor token post attempt' },
     });
-    assert.strictEqual(test5.status, 403, 'Public write with forged token must be HTTP 403');
+    assert.strictEqual(test7.status, 403, 'Public write with forged token must be HTTP 403');
     console.log('   ✅ PASS: Public write denied for invalid visitor token (HTTP 403)');
 
-    // Test 6: Public write denied to foreign conversation
-    console.log('6. Testing: Public write denied to foreign conversation...');
-    const test6 = await request({
+    // Test 8: Public write denied to foreign conversation (cross-conversation binding defense)
+    console.log('8. Testing: Public write denied to foreign conversation...');
+    const test8 = await request({
       method: 'POST',
       path: `/api/v1/public/conversations/${convB.id}/messages`,
       headers: { 'x-visitor-token': visitorRawToken }, // Token is only valid for convA
       body: { message: 'Cross-conversation spoofing injection' },
     });
-    assert.strictEqual(test6.status, 403, 'Visitor token bound to Conv A cannot post to Conv B');
+    assert.strictEqual(test8.status, 403, 'Visitor token bound to Conv A cannot post to Conv B');
     console.log('   ✅ PASS: Public write denied to foreign conversation (HTTP 403)');
 
-    console.log('\n--- TEST CASES 7-11: TENANT ISOLATION & FOREIGN-KEY TAMPER DEFENSES ---');
+    // Test 9: Visitor session with null conversationId strictly denied
+    console.log('9. Testing: Visitor session with null conversationId strictly denied...');
+    const unboundToken = `vst_unbound_${crypto.randomBytes(20).toString('hex')}`;
+    const unboundHash = crypto.createHash('sha256').update(unboundToken).digest('hex');
+    const unboundSession = await prisma.visitorSession.create({
+      data: {
+        inboxId: convA.inboxId,
+        customerId: convA.customerId,
+        conversationId: null, // Null conversation binding
+        tokenHash: unboundHash,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      },
+    });
+    createdSessionIds.push(unboundSession.id);
 
-    // Test 7: Agent denied cross-tenant conversation read
-    console.log('7. Testing: Agent denied cross-tenant conversation read...');
-    const test7 = await request({
+    const test9 = await request({
+      method: 'GET',
+      path: `/api/v1/public/conversations/${convA.id}`,
+      headers: { 'x-visitor-token': unboundToken },
+    });
+    assert.strictEqual(test9.status, 403, 'Unbound visitor session with null conversationId must be HTTP 403');
+    console.log('   ✅ PASS: Visitor session with null conversationId strictly denied (HTTP 403)');
+
+    console.log('\n--- SECTION 2: TENANT ISOLATION & FOREIGN-KEY TAMPER DEFENSES ---');
+
+    // Test 10: Agent denied cross-tenant conversation read
+    console.log('10. Testing: Agent denied cross-tenant conversation read...');
+    const test10 = await request({
       method: 'GET',
       path: `/api/v1/conversations/${convB.id}`,
       headers: headersA,
     });
-    assert.strictEqual(test7.status, 404, 'Cross-tenant conversation read must return 404');
+    assert.strictEqual(test10.status, 404, 'Cross-tenant conversation read must return 404');
     console.log('   ✅ PASS: Agent denied cross-tenant conversation read (HTTP 404)');
 
-    // Test 8: Agent denied cross-tenant conversation write
-    console.log('8. Testing: Agent denied cross-tenant conversation write...');
-    const test8 = await request({
+    // Test 11: Agent denied cross-tenant conversation write
+    console.log('11. Testing: Agent denied cross-tenant conversation write...');
+    const test11 = await request({
       method: 'POST',
       path: `/api/v1/conversations/${convB.id}/messages`,
       headers: headersA,
       body: { content: 'Cross-tenant message injection', messageType: 'PUBLIC_REPLY' },
     });
-    assert.strictEqual(test8.status, 404, 'Cross-tenant message post must return 404');
+    assert.strictEqual(test11.status, 404, 'Cross-tenant message post must return 404');
     console.log('   ✅ PASS: Agent denied cross-tenant conversation write (HTTP 404)');
 
-    // Test 9: Agent denied cross-tenant customer update
-    console.log('9. Testing: Agent denied cross-tenant customer update...');
-    const test9 = await request({
+    // Test 12: Agent denied cross-tenant customer update
+    console.log('12. Testing: Agent denied cross-tenant customer update...');
+    const test12 = await request({
       method: 'PATCH',
       path: `/api/v1/customers/${custB.id}`,
       headers: headersA,
       body: { name: 'Customer profile compromised by Org A' },
     });
-    assert.strictEqual(test9.status, 404, 'Cross-tenant customer update must return 404');
+    assert.strictEqual(test12.status, 404, 'Cross-tenant customer update must return 404');
     console.log('   ✅ PASS: Agent denied cross-tenant customer update (HTTP 404)');
 
-    // Test 10: Agent denied cross-tenant ticket modification
-    console.log('10. Testing: Agent denied cross-tenant ticket modification...');
-    const test10 = await request({
+    // Test 13: Agent denied cross-tenant ticket modification
+    console.log('13. Testing: Agent denied cross-tenant ticket modification...');
+    const test13 = await request({
       method: 'PATCH',
       path: `/api/v1/tickets/${ticketB.id}`,
       headers: headersA,
       body: { status: 'RESOLVED', priority: 'LOW' },
     });
-    assert.strictEqual(test10.status, 404, 'Cross-tenant ticket modification must return 404');
+    assert.strictEqual(test13.status, 404, 'Cross-tenant ticket modification must return 404');
     console.log('   ✅ PASS: Agent denied cross-tenant ticket modification (HTTP 404)');
 
-    // Test 11: Agent cannot assign foreign tenant agent to conversation
-    console.log('11. Testing: Agent cannot assign foreign tenant agent to conversation...');
-    const test11 = await request({
+    // Test 14: Agent cannot assign foreign tenant agent to conversation
+    console.log('14. Testing: Agent cannot assign foreign tenant agent to conversation...');
+    const test14 = await request({
       method: 'PATCH',
       path: `/api/v1/conversations/${convA.id}`,
       headers: headersA,
-      body: { assigneeId: agentBId }, // Attempting to assign Sarah (Org B) to Acme (Org A)
+      body: { assigneeId: agentBId }, // Attempting to assign Maya (Org B) to Acme (Org A)
     });
-    assert.strictEqual(test11.status, 400, 'Cross-tenant agent assignment must be blocked with 400 Bad Request');
+    assert.strictEqual(test14.status, 400, 'Cross-tenant agent assignment must be blocked with 400 Bad Request');
     console.log('   ✅ PASS: Agent cannot assign foreign tenant agent to conversation (HTTP 400)');
 
-    console.log('\n--- TEST CASES 12-13: REAL-TIME WEBSOCKET SECURITY & ROOM ACCESS ---');
+    console.log('\n--- SECTION 3: REAL-TIME WEBSOCKET ORIGIN & ROOM SECURITY ---');
 
-    // Test 12: WebSocket room join rejected without auth
-    console.log('12. Testing: WebSocket connection rejected without auth...');
+    // Test 15: WebSocket connection rejected without auth
+    console.log('15. Testing: WebSocket connection rejected without auth...');
     const unauthSocketResult = await new Promise<string>((res) => {
       const sock = ClientIO(`http://localhost:${TEST_PORT}`, {
         transports: ['websocket'],
@@ -287,10 +358,36 @@ async function runSecurityRemediationSuite() {
     );
     console.log('   ✅ PASS: WebSocket connection rejected without auth');
 
-    // Test 13: Visitor cannot join another visitor's conversation room
-    console.log("13. Testing: Visitor cannot join another visitor's conversation room...");
+    // Test 16: Agent WebSocket connection rejected from unauthorized origin
+    console.log('16. Testing: Agent WebSocket rejected from unauthorized third-party origin...');
+    const unauthorizedOriginResult = await new Promise<string>((res) => {
+      const sock = ClientIO(`http://localhost:${TEST_PORT}`, {
+        transports: ['websocket'],
+        auth: { token: tokenA },
+        extraHeaders: { origin: 'https://malicious-attacker-site.com' },
+        reconnection: false,
+        timeout: 2000,
+      });
+
+      sock.on('connect', () => {
+        sock.disconnect();
+        res('CONNECTED');
+      });
+
+      sock.on('connect_error', (err) => {
+        sock.disconnect();
+        res(err.message);
+      });
+    });
+    assert.ok(
+      unauthorizedOriginResult.includes('unauthorized origin') || unauthorizedOriginResult.includes('Authentication failed'),
+      `Agent socket from unauthorized origin must be rejected. Got: ${unauthorizedOriginResult}`
+    );
+    console.log('   ✅ PASS: Agent WebSocket connection rejected from unauthorized origin');
+
+    // Test 17: Visitor cannot join another visitor's conversation room
+    console.log("17. Testing: Visitor cannot join another visitor's conversation room...");
     const unauthorizedRoomJoin = await new Promise<string>((res) => {
-      // Connect as verified visitor for convA
       const sock = ClientIO(`http://localhost:${TEST_PORT}`, {
         transports: ['websocket'],
         auth: {
@@ -301,7 +398,6 @@ async function runSecurityRemediationSuite() {
       });
 
       sock.on('connect', () => {
-        // Attempt to join conversation B's room
         sock.emit('join:conversation', convB.id);
       });
 
@@ -321,26 +417,189 @@ async function runSecurityRemediationSuite() {
     );
     console.log("   ✅ PASS: Visitor cannot join another visitor's conversation room");
 
-    console.log('\n--- TEST CASE 14: SUBSCRIPTION PLAN TAMPERING DEFENSE ---');
+    console.log('\n--- SECTION 4: AUTHENTICATION IMPROVEMENTS & ATOMIC REFRESH TOKENS ---');
 
-    // Test 14: Organization plan tampering rejected on PATCH /organizations/current
-    console.log('14. Testing: Organization plan tampering rejected on PATCH /organizations/current...');
-    const test14 = await request({
+    // Test 18: Organization plan tampering rejected on PATCH /organizations/current
+    console.log('18. Testing: Organization plan tampering rejected on PATCH /organizations/current...');
+    const test18 = await request({
       method: 'PATCH',
       path: '/api/v1/organizations/current',
       headers: headersA,
       body: { plan: 'ENTERPRISE' },
     });
-    assert.strictEqual(test14.status, 403, 'Direct client plan tampering must be rejected with HTTP 403 Forbidden');
+    assert.strictEqual(test18.status, 403, 'Direct client plan tampering must be rejected with HTTP 403 Forbidden');
     console.log('   ✅ PASS: Organization plan tampering rejected on PATCH /organizations/current (HTTP 403)');
 
-    console.log('\n================================================================');
-    console.log('🏆 ALL 14 CRITICAL SECURITY AUDIT REMEDIATION TEST CASES PASSED!');
-    console.log('================================================================');
+    // Test 19: Dynamic legacy SHA-256 hash upgrade to bcrypt on login
+    console.log('19. Testing: Dynamic legacy SHA-256 hash upgrade to bcrypt on login...');
+    const legacyEmail = `legacy_${Date.now()}@example.com`;
+    const legacyPass = 'LegacyPassword123!';
+    const legacySha256Hash = crypto.createHash('sha256').update(legacyPass + 'supportos_salt_2026').digest('hex');
 
-    process.exit(0);
+    const legacyUser = await prisma.user.create({
+      data: {
+        organizationId: convA.organizationId,
+        email: legacyEmail,
+        passwordHash: legacySha256Hash, // Seeded with old SHA-256 hash
+        firstName: 'Legacy',
+        lastName: 'Account',
+        role: 'AGENT',
+        status: 'ACTIVE',
+      },
+    });
+    createdUserIds.push(legacyUser.id);
+
+    const legacyLogin = await request({
+      method: 'POST',
+      path: '/api/v1/auth/login',
+      body: { email: legacyEmail, password: legacyPass },
+    });
+    assert.strictEqual(legacyLogin.status, 200, 'Legacy login must succeed');
+
+    const upgradedUser = await prisma.user.findUnique({ where: { id: legacyUser.id } });
+    assert.ok(
+      upgradedUser?.passwordHash.startsWith('$2a$') || upgradedUser?.passwordHash.startsWith('$2b$'),
+      'Password hash must be dynamically upgraded to bcrypt ($2a$/$2b$)'
+    );
+    console.log('   ✅ PASS: Legacy password hash successfully upgraded to bcrypt automatically');
+
+    // Test 20: Atomic refresh token rotation & concurrent reuse rejection
+    console.log('20. Testing: Atomic refresh token rotation prevents concurrent reuse...');
+    const initialRefresh = legacyLogin.data.refreshToken;
+    assert.ok(initialRefresh, 'Login must yield a valid refresh token');
+
+    // Fire 2 concurrent refresh requests with the EXACT SAME refresh token
+    const [refreshRes1, refreshRes2] = await Promise.all([
+      request({
+        method: 'POST',
+        path: '/api/v1/auth/refresh',
+        body: { refreshToken: initialRefresh },
+      }),
+      request({
+        method: 'POST',
+        path: '/api/v1/auth/refresh',
+        body: { refreshToken: initialRefresh },
+      }),
+    ]);
+
+    // Exactly one must succeed (200) and the other must be rejected (401)
+    const statuses = [refreshRes1.status, refreshRes2.status].sort();
+    assert.deepStrictEqual(statuses, [200, 401], 'Exactly one concurrent refresh must succeed; the other must fail (CAS)');
+    console.log('   ✅ PASS: Atomic CAS refresh token rotation prevents token reuse and race conditions');
+
+    // Test 21: Revoked refresh token cannot be refreshed
+    console.log('21. Testing: Revoked refresh token cannot be refreshed...');
+    const activeRefresh = refreshRes1.status === 200 ? refreshRes1.data.refreshToken : refreshRes2.data.refreshToken;
+    // Explicitly logout / revoke
+    await request({
+      method: 'POST',
+      path: '/api/v1/auth/logout',
+      body: { refreshToken: activeRefresh },
+    });
+
+    const revokedRefreshAttempt = await request({
+      method: 'POST',
+      path: '/api/v1/auth/refresh',
+      body: { refreshToken: activeRefresh },
+    });
+    assert.strictEqual(revokedRefreshAttempt.status, 401, 'Revoked refresh token must be rejected with 401');
+    console.log('   ✅ PASS: Revoked refresh token rejected on refresh attempt (HTTP 401)');
+
+    console.log('\n--- SECTION 5: BILLING WEBHOOK IDEMPOTENCY & RAW SIGNATURE DEFENSES ---');
+
+    // Test 22: Billing webhook signature verified with raw body
+    console.log('22. Testing: Billing webhook signature verified with authentic raw body...');
+    const testEventId = `evt_billing_${Date.now()}`;
+    const webhookPayload = JSON.stringify({
+      id: testEventId,
+      event: 'subscription.updated',
+      organizationId: convA.organizationId,
+      plan: 'BUSINESS',
+      status: 'ACTIVE',
+    });
+    const webhookRawBuffer = Buffer.from(webhookPayload, 'utf-8');
+    const validSignature = crypto
+      .createHmac('sha256', config.billingWebhookSecret)
+      .update(webhookRawBuffer)
+      .digest('hex');
+
+    const webhookRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: {
+        'x-billing-signature': validSignature,
+        'x-billing-event-id': testEventId,
+      },
+      rawBody: webhookRawBuffer,
+    });
+    assert.strictEqual(webhookRes.status, 200, 'Valid signed webhook must return HTTP 200');
+    console.log('   ✅ PASS: Billing webhook signature verified over raw request buffer (HTTP 200)');
+
+    // Test 23: Billing webhook replay attack rejected (idempotency)
+    console.log('23. Testing: Billing webhook replay attack rejected via event idempotency...');
+    const replayRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: {
+        'x-billing-signature': validSignature,
+        'x-billing-event-id': testEventId, // Reusing same signature & event
+      },
+      rawBody: webhookRawBuffer,
+    });
+    assert.strictEqual(replayRes.status, 200);
+    assert.strictEqual(replayRes.data.idempotent, true, 'Replayed webhook must return idempotent marker');
+    console.log('   ✅ PASS: Replay attack intercepted; duplicate webhook processed idempotently');
+
+    // Test 24: Billing webhook rejects unallowed plan
+    console.log('24. Testing: Billing webhook rejects unallowed plan value...');
+    const invalidPlanPayload = JSON.stringify({
+      id: `evt_invalid_plan_${Date.now()}`,
+      event: 'subscription.updated',
+      organizationId: convA.organizationId,
+      plan: 'ULTRA_HACKED_TIER',
+    });
+    const invalidPlanRaw = Buffer.from(invalidPlanPayload, 'utf-8');
+    const invalidPlanSig = crypto
+      .createHmac('sha256', config.billingWebhookSecret)
+      .update(invalidPlanRaw)
+      .digest('hex');
+
+    const invalidPlanRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: { 'x-billing-signature': invalidPlanSig },
+      rawBody: invalidPlanRaw,
+    });
+    assert.strictEqual(invalidPlanRes.status, 400, 'Unallowed plan must be rejected with 400 Bad Request');
+    console.log('   ✅ PASS: Billing webhook strictly rejects unallowed subscription tier values (HTTP 400)');
+
+    // Test 25: Billing webhook rejects forged signature
+    console.log('25. Testing: Billing webhook rejects forged signature...');
+    const forgedWebhookRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: { 'x-billing-signature': 'forged_fake_signature_aabbccddeeff' },
+      rawBody: webhookRawBuffer,
+    });
+    assert.strictEqual(forgedWebhookRes.status, 401, 'Forged signature must be rejected with HTTP 401 Unauthorized');
+    console.log('   ✅ PASS: Forged billing webhook signature rejected (HTTP 401)');
+
+    console.log('\n================================================================');
+    console.log('🏆 ALL 25 RIGOROUS SECURITY REMEDIATION TEST CASES PASSED!');
+    console.log('================================================================');
   } finally {
-    server.close();
+    // Isolated test data cleanup
+    if (createdSessionIds.length > 0) {
+      await prisma.visitorSession.deleteMany({ where: { id: { in: createdSessionIds } } }).catch(() => {});
+    }
+    if (createdUserIds.length > 0) {
+      await prisma.refreshToken.deleteMany({ where: { userId: { in: createdUserIds } } }).catch(() => {});
+      await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } }).catch(() => {});
+    }
+
+    // Reliable server & connection teardown
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await prisma.$disconnect();
   }
 }
 

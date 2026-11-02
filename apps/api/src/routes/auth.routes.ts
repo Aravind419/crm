@@ -204,6 +204,16 @@ router.post('/login', authRateLimiter, async (req: Request, res: Response): Prom
       return;
     }
 
+    // DYNAMIC HASH UPGRADE: If user authenticated with legacy SHA-256 hash, upgrade to bcrypt immediately
+    if (!user.passwordHash.startsWith('$2a$') && !user.passwordHash.startsWith('$2b$')) {
+      const modernBcryptHash = await hashPassword(password);
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { passwordHash: modernBcryptHash },
+      });
+      console.log(`[Security] Upgraded legacy password hash to bcrypt for user ${user.id}`);
+    }
+
     if (user.status !== 'ACTIVE') {
       res.status(403).json({ error: 'Forbidden', message: 'Account is deactivated' });
       return;
@@ -262,7 +272,7 @@ router.post('/login', authRateLimiter, async (req: Request, res: Response): Prom
 
 /**
  * POST /api/v1/auth/refresh
- * Rotates refresh token and issues new access token.
+ * ATOMIC REFRESH TOKEN ROTATION: CAS update ensures exactly one caller succeeds on concurrent calls.
  */
 router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
   try {
@@ -273,49 +283,80 @@ router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+    const tokenHash = crypto.createHash('sha256').update(refreshToken.trim()).digest('hex');
 
-    const storedToken = await prisma.refreshToken.findUnique({
-      where: { tokenHash },
-      include: {
-        user: {
-          include: { organization: true },
+    // Atomic CAS rotation inside transaction to prevent concurrent refresh race conditions
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Atomically revoke ONLY if currently active and not expired
+      const updateCount = await tx.refreshToken.updateMany({
+        where: {
+          tokenHash,
+          revoked: false,
+          expiresAt: { gt: new Date() },
         },
-      },
+        data: {
+          revoked: true,
+        },
+      });
+
+      if (updateCount.count === 0) {
+        // Token was already revoked, expired, or non-existent (e.g. concurrent attempt)
+        return null;
+      }
+
+      // 2. Fetch the user associated with this token
+      const existingToken = await tx.refreshToken.findUnique({
+        where: { tokenHash },
+        include: {
+          user: {
+            include: { organization: true },
+          },
+        },
+      });
+
+      if (!existingToken || existingToken.user.status !== 'ACTIVE') {
+        return null;
+      }
+
+      // 3. Issue new refresh token within the same transaction
+      const newRawToken = crypto.randomBytes(40).toString('hex');
+      const newTokenHash = crypto.createHash('sha256').update(newRawToken).digest('hex');
+      const newExpiresAt = new Date(Date.now() + config.refreshTokenExpiresDays * 24 * 60 * 60 * 1000);
+
+      await tx.refreshToken.create({
+        data: {
+          userId: existingToken.userId,
+          tokenHash: newTokenHash,
+          expiresAt: newExpiresAt,
+          revoked: false,
+        },
+      });
+
+      const newAccessToken = jwt.sign(
+        {
+          userId: existingToken.user.id,
+          organizationId: existingToken.user.organizationId,
+          email: existingToken.user.email,
+          role: existingToken.user.role,
+        },
+        config.jwtSecret,
+        { expiresIn: config.jwtExpiresIn as any }
+      );
+
+      return {
+        accessToken: newAccessToken,
+        refreshToken: newRawToken,
+      };
     });
 
-    if (!storedToken || storedToken.revoked || storedToken.expiresAt < new Date()) {
-      res.status(401).json({ error: 'Unauthorized', message: 'Invalid, expired, or revoked refresh token' });
+    if (!result) {
+      res.status(401).json({ error: 'Unauthorized', message: 'Invalid, expired, or already used refresh token' });
       return;
     }
-
-    if (storedToken.user.status !== 'ACTIVE') {
-      res.status(403).json({ error: 'Forbidden', message: 'User account is not active' });
-      return;
-    }
-
-    // Revoke old token and create new one atomically
-    await prisma.refreshToken.update({
-      where: { id: storedToken.id },
-      data: { revoked: true },
-    });
-
-    const newRefreshToken = await createRefreshToken(storedToken.userId);
-
-    const token = jwt.sign(
-      {
-        userId: storedToken.user.id,
-        organizationId: storedToken.user.organizationId,
-        email: storedToken.user.email,
-        role: storedToken.user.role,
-      },
-      config.jwtSecret,
-      { expiresIn: config.jwtExpiresIn as any }
-    );
 
     res.json({
-      token,
-      refreshToken: newRefreshToken,
+      token: result.accessToken,
+      refreshToken: result.refreshToken,
       message: 'Token rotated successfully',
     });
   } catch (err: any) {
@@ -333,7 +374,7 @@ router.post('/logout', async (req: Request, res: Response): Promise<void> => {
     const { refreshToken } = req.body;
 
     if (refreshToken && typeof refreshToken === 'string') {
-      const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+      const tokenHash = crypto.createHash('sha256').update(refreshToken.trim()).digest('hex');
       await prisma.refreshToken.updateMany({
         where: { tokenHash },
         data: { revoked: true },

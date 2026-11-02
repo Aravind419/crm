@@ -11,14 +11,30 @@ export function initSocketService(server: HttpServer): SocketIOServer {
   io = new SocketIOServer(server, {
     cors: {
       origin: (origin, callback) => {
-        // Allow same-origin or server-to-server requests
+        // Allow same-origin or non-browser server-to-server requests
         if (!origin) return callback(null, true);
-        const allowed = config.corsOrigins.includes(origin) || origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1');
-        if (allowed) {
+
+        // Allow configured agent/admin web origins
+        const isAgentOrigin =
+          config.corsOrigins.includes(origin) ||
+          origin.startsWith('http://localhost') ||
+          origin.startsWith('http://127.0.0.1');
+
+        if (isAgentOrigin) {
           return callback(null, true);
         }
-        // Allow widget embeds from any web page, but require auth credentials for the socket connection
-        return callback(null, true);
+
+        // Allow configured widget embedder origins
+        const isWidgetAllowed =
+          config.allowedWidgetOrigins.includes('*') ||
+          config.allowedWidgetOrigins.includes(origin);
+
+        if (isWidgetAllowed) {
+          return callback(null, true);
+        }
+
+        // Deliberate rejection of unauthorized origins
+        return callback(new Error('Origin rejected by Socket.IO CORS security policy'), false);
       },
       methods: ['GET', 'POST'],
       credentials: true,
@@ -31,6 +47,18 @@ export function initSocketService(server: HttpServer): SocketIOServer {
       // 1. Check for Agent JWT Authentication
       const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace('Bearer ', '');
       if (token) {
+        // ORIGIN SECURITY: Agent credentials can ONLY be used from authorized agent origins
+        const socketOrigin = socket.handshake.headers?.origin;
+        const isAuthorizedAgentOrigin =
+          !socketOrigin ||
+          config.corsOrigins.includes(socketOrigin) ||
+          socketOrigin.startsWith('http://localhost') ||
+          socketOrigin.startsWith('http://127.0.0.1');
+
+        if (!isAuthorizedAgentOrigin) {
+          return next(new Error('Authentication failed: Agent credentials cannot be utilized from unauthorized origin'));
+        }
+
         try {
           const payload = jwt.verify(token, config.jwtSecret) as {
             userId: string;
@@ -52,7 +80,6 @@ export function initSocketService(server: HttpServer): SocketIOServer {
             return next();
           }
         } catch (jwtErr) {
-          // Token provided but invalid
           return next(new Error('Authentication failed: Invalid or expired agent token'));
         }
       }
@@ -64,52 +91,47 @@ export function initSocketService(server: HttpServer): SocketIOServer {
       if (visitorToken && conversationId) {
         const rawToken = String(visitorToken).trim();
         const convId = String(conversationId).trim();
+
+        if (!rawToken || !convId) {
+          return next(new Error('Authentication failed: Missing token or conversation ID'));
+        }
+
         const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
 
-        // Look up verified visitor session in database
+        // Look up verified visitor session strictly by SHA-256 tokenHash
         const session = await prisma.visitorSession.findFirst({
           where: { tokenHash },
-          include: { conversation: true },
+          select: {
+            id: true,
+            customerId: true,
+            conversationId: true,
+            expiresAt: true,
+            revokedAt: true,
+          },
         });
 
-        if (session) {
-          if (session.revokedAt) {
-            return next(new Error('Authentication failed: Visitor session has been revoked'));
-          }
-          if (session.expiresAt < new Date()) {
-            return next(new Error('Authentication failed: Visitor session expired'));
-          }
-          if (session.conversationId && session.conversationId !== convId) {
-            return next(new Error('Authentication failed: Visitor session token not authorized for this conversation'));
-          }
-
-          socket.data.visitorToken = rawToken;
-          socket.data.conversationId = convId;
-          socket.data.customerId = session.customerId;
-          socket.data.isVisitor = true;
-          return next();
+        if (!session) {
+          return next(new Error('Authentication failed: Invalid visitor session credentials'));
         }
 
-        // Fallback: check customer custom attributes for backward compatibility
-        const conv = await prisma.conversation.findUnique({
-          where: { id: convId },
-          include: { customer: true },
-        });
-
-        if (conv?.customer?.customAttributes) {
-          try {
-            const attrs = JSON.parse(conv.customer.customAttributes);
-            if (attrs.visitorToken === rawToken) {
-              socket.data.visitorToken = rawToken;
-              socket.data.conversationId = convId;
-              socket.data.customerId = conv.customerId;
-              socket.data.isVisitor = true;
-              return next();
-            }
-          } catch (e) {}
+        if (session.revokedAt) {
+          return next(new Error('Authentication failed: Visitor session has been revoked'));
         }
 
-        return next(new Error('Authentication failed: Invalid visitor session credentials'));
+        if (session.expiresAt < new Date()) {
+          return next(new Error('Authentication failed: Visitor session expired'));
+        }
+
+        // Strict Conversation ID binding: session MUST have a non-null conversationId matching the requested convId
+        if (!session.conversationId || session.conversationId !== convId) {
+          return next(new Error('Authentication failed: Visitor session token not authorized for this conversation'));
+        }
+
+        socket.data.visitorToken = rawToken;
+        socket.data.conversationId = convId;
+        socket.data.customerId = session.customerId;
+        socket.data.isVisitor = true;
+        return next();
       }
 
       // 3. Reject Unauthenticated Connections

@@ -9,26 +9,49 @@ import { EntitlementService } from '../services/entitlement.service';
 
 const router = Router();
 
+const ALLOWED_WEBHOOK_EVENTS = [
+  'subscription.created',
+  'subscription.updated',
+  'subscription.cancelled',
+  'invoice.payment_succeeded',
+  'invoice.payment_failed',
+];
+
+const ALLOWED_PLANS = ['FREE', 'TEAM', 'GROWTH', 'BUSINESS', 'ENTERPRISE'];
+const ALLOWED_STATUSES = ['ACTIVE', 'SUSPENDED', 'TRIAL'];
+
 /**
  * POST /api/v1/organizations/billing/webhook
- * Authenticated via HMAC-SHA256 signature from payment provider.
+ * Authenticated via HMAC-SHA256 signature calculated over the authentic raw request body.
+ * Enforces replay protection, event idempotency, and strict value whitelists.
  */
 router.post('/billing/webhook', async (req: Request, res: Response): Promise<void> => {
   try {
     const signature = req.headers['x-billing-signature'];
-    const payload = JSON.stringify(req.body);
+    const timestamp = req.headers['x-billing-timestamp'];
+    const rawPayload: Buffer = (req as any).rawBody || Buffer.from(JSON.stringify(req.body));
 
     if (!signature || typeof signature !== 'string') {
       res.status(401).json({ error: 'Unauthorized', message: 'Missing billing signature' });
       return;
     }
 
+    // Replay attack prevention: verify timestamp if provided (tolerance: 5 minutes)
+    if (timestamp && typeof timestamp === 'string') {
+      const eventTime = parseInt(timestamp, 10);
+      const currentTime = Math.floor(Date.now() / 1000);
+      if (isNaN(eventTime) || Math.abs(currentTime - eventTime) > 300) {
+        res.status(401).json({ error: 'Unauthorized', message: 'Webhook timestamp expired or invalid' });
+        return;
+      }
+    }
+
     const expectedSignature = crypto
       .createHmac('sha256', config.billingWebhookSecret)
-      .update(payload)
+      .update(rawPayload)
       .digest('hex');
 
-    // Constant-time signature comparison to prevent timing attacks
+    // Constant-time signature comparison to eliminate timing side-channels
     const sigBuffer = Buffer.from(signature);
     const expectedBuffer = Buffer.from(expectedSignature);
     if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
@@ -36,13 +59,50 @@ router.post('/billing/webhook', async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    const { event, organizationId, plan, status } = req.body;
+    const { event, organizationId, plan, status, id, eventId } = req.body;
 
-    if (!organizationId || !plan) {
-      res.status(400).json({ error: 'Bad Request', message: 'Missing required webhook fields' });
+    // 1. Strict Whitelist Validations
+    if (!event || !ALLOWED_WEBHOOK_EVENTS.includes(event)) {
+      res.status(400).json({ error: 'Bad Request', message: `Invalid or unallowed webhook event: ${event}` });
       return;
     }
 
+    if (!organizationId || typeof organizationId !== 'string') {
+      res.status(400).json({ error: 'Bad Request', message: 'organizationId is required' });
+      return;
+    }
+
+    if (!plan || !ALLOWED_PLANS.includes(String(plan).toUpperCase())) {
+      res.status(400).json({ error: 'Bad Request', message: `Invalid or unallowed subscription plan: ${plan}` });
+      return;
+    }
+
+    if (status && !ALLOWED_STATUSES.includes(String(status).toUpperCase())) {
+      res.status(400).json({ error: 'Bad Request', message: `Invalid or unallowed subscription status: ${status}` });
+      return;
+    }
+
+    // 2. Event Idempotency & Replay Protection
+    const uniqueEventId = req.headers['x-billing-event-id'] || id || eventId;
+    if (uniqueEventId && typeof uniqueEventId === 'string') {
+      const alreadyProcessed = await prisma.auditEvent.findFirst({
+        where: {
+          action: 'BILLING_WEBHOOK_PROCESSED',
+          entityId: uniqueEventId,
+        },
+      });
+
+      if (alreadyProcessed) {
+        res.status(200).json({
+          success: true,
+          idempotent: true,
+          message: 'Webhook event already processed (idempotent duplicate)',
+        });
+        return;
+      }
+    }
+
+    // 3. Apply Plan Update Atomically
     const org = await prisma.organization.update({
       where: { id: organizationId },
       data: {
@@ -51,15 +111,18 @@ router.post('/billing/webhook', async (req: Request, res: Response): Promise<voi
       },
     });
 
-    await prisma.auditEvent.create({
-      data: {
-        organizationId: org.id,
-        action: 'PLAN_UPGRADED_VIA_BILLING',
-        entityType: 'Organization',
-        entityId: org.id,
-        metadata: JSON.stringify({ event, newPlan: plan, status }),
-      },
-    }).catch(() => {});
+    // 4. Record Audit Event and Idempotency Marker
+    if (uniqueEventId && typeof uniqueEventId === 'string') {
+      await prisma.auditEvent.create({
+        data: {
+          organizationId: org.id,
+          action: 'BILLING_WEBHOOK_PROCESSED',
+          entityType: 'BillingEvent',
+          entityId: uniqueEventId,
+          metadata: JSON.stringify({ event, newPlan: plan, status }),
+        },
+      }).catch(() => {});
+    }
 
     res.json({ success: true, message: `Organization plan successfully updated to ${plan}` });
   } catch (err: any) {

@@ -1,0 +1,57 @@
+name: SupportOS CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Build, Lint & Security Test Verification
+    runs-on: ubuntu-latest
+
+    env:
+      NODE_ENV: development
+      PORT: 4000
+      JWT_SECRET: supportos_ci_test_secret_key_random_long_string_2026
+      BILLING_WEBHOOK_SECRET: supportos_ci_billing_secret_key_random_long_string_2026
+      DATABASE_URL: "file:./dev.db"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js v20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Workspace Dependencies
+        run: npm install
+
+      - name: Setup & Migrate Database
+        run: |
+          npx prisma generate
+          npx prisma db push
+          npx ts-node prisma/seed.ts
+
+      - name: Run Core API Tests
+        run: npm --prefix apps/api test
+
+      - name: Run Multi-Tenant Isolation Tests
+        run: npm --prefix apps/api run test:security
+
+      - name: Run 25-Point Comprehensive Security Remediation Suite
+        run: npm --prefix apps/api run test:remediation
+
+      - name: Compile Backend TypeScript Build
+        run: npm --prefix apps/api run build
+
+      - name: Compile Frontend Next.js Production Build
+        run: npm --prefix apps/web run build

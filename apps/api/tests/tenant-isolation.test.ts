@@ -169,9 +169,9 @@ async function runTenantIsolationTests() {
     console.log('   ✅ List queries proven strictly partitioned by tenant boundary.');
 
     console.log('\n🛡️ ALL TENANT ISOLATION SECURITY TESTS PASSED! ZERO DATA LEAKAGE DETECTED.');
-    process.exit(0);
   } finally {
-    server.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await prisma.$disconnect();
   }
 }
 

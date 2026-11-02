@@ -1,6 +1,7 @@
 import assert from 'assert';
 import http from 'http';
 import { app, server } from '../src/server';
+import { prisma } from '../src/prisma';
 
 const TEST_PORT = 4999;
 
@@ -177,11 +178,11 @@ async function runTests() {
     assert.strictEqual(unauthFetch.status, 403, 'Unauthorized conversation read without visitor token must be 403');
     console.log('   ✅ IDOR defense verified: Unauthenticated conversation query blocked with 403.');
 
-    // B) Authorized request with correct visitor token MUST succeed
+    // B) Authorized request with correct server-generated visitor token MUST succeed
     const authFetch = await request({
       method: 'GET',
       path: `/api/v1/public/conversations/${visitorConvId}`,
-      headers: { 'x-visitor-token': visitorSessionToken },
+      headers: { 'x-visitor-token': visitorConv.data.visitorToken },
     });
     assert.strictEqual(authFetch.status, 200);
     assert.ok(
@@ -210,9 +211,9 @@ async function runTests() {
     console.log(`   ✅ Reporting metrics verified (Total Conversations: ${reports.data.metrics.totalConversations}).`);
 
     console.log('\n🎉 ALL CORE API & SECURITY REMEDIATION TESTS PASSED!');
-    process.exit(0);
   } finally {
-    server.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await prisma.$disconnect();
   }
 }
 
