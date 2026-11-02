@@ -1,0 +1,390 @@
+// SupportOS Multi-Tenant Database Schema for Production PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Plan {
+  FREE
+  TEAM
+  BUSINESS
+  ENTERPRISE
+}
+
+enum OrgStatus {
+  ACTIVE
+  SUSPENDED
+  TRIAL
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  AGENT
+}
+
+enum UserStatus {
+  ACTIVE
+  INVITED
+  DEACTIVATED
+}
+
+enum ChannelType {
+  WEB_WIDGET
+  EMAIL
+  API
+}
+
+enum ConversationStatus {
+  OPEN
+  PENDING
+  SNOOZED
+  RESOLVED
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum SenderType {
+  CUSTOMER
+  AGENT
+  SYSTEM
+  AI_BOT
+}
+
+enum MessageType {
+  PUBLIC_REPLY
+  INTERNAL_NOTE
+}
+
+enum TicketStatus {
+  NEW
+  OPEN
+  PENDING
+  ON_HOLD
+  RESOLVED
+  CLOSED
+}
+
+enum ArticleStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model Organization {
+  id        String    @id @default(uuid())
+  name      String
+  slug      String    @unique
+  plan      Plan      @default(BUSINESS)
+  status    OrgStatus @default(ACTIVE)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  workspaces      Workspace[]
+  users           User[]
+  teams           Team[]
+  inboxes         Inbox[]
+  customers       Customer[]
+  conversations   Conversation[]
+  tickets         Ticket[]
+  categories      Category[]
+  articles        Article[]
+  automationRules AutomationRule[]
+  auditEvents     AuditEvent[]
+
+  @@map("organizations")
+}
+
+model Workspace {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  slug           String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  inboxes       Inbox[]
+  conversations Conversation[]
+
+  @@unique([organizationId, slug])
+  @@map("workspaces")
+}
+
+model User {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  email          String
+  passwordHash   String
+  firstName      String
+  lastName       String
+  role           UserRole     @default(AGENT)
+  status         UserStatus   @default(ACTIVE)
+  isAvailable    Boolean      @default(true)
+  avatarUrl      String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  teamMemberships  TeamMember[]
+  assignedConvs    Conversation[]  @relation("AssignedAgent")
+  assignedTickets  Ticket[]        @relation("AssignedTicketAgent")
+  ticketComments   TicketComment[]
+  authoredArticles Article[]
+
+  @@unique([organizationId, email])
+  @@index([organizationId])
+  @@map("users")
+}
+
+model Team {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  members       TeamMember[]
+  conversations Conversation[]
+  tickets       Ticket[]
+
+  @@index([organizationId])
+  @@map("teams")
+}
+
+model TeamMember {
+  id        String   @id @default(uuid())
+  teamId    String
+  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([teamId, userId])
+  @@map("team_members")
+}
+
+model Inbox {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  workspaceId    String?
+  workspace      Workspace?   @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  name           String
+  channelType    ChannelType  @default(WEB_WIDGET)
+  inboxKey       String       @unique
+  widgetColor    String       @default("#2563EB")
+  greeting       String       @default("Hello! How can we assist you today?")
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  conversations Conversation[]
+
+  @@index([organizationId])
+  @@map("inboxes")
+}
+
+model Customer {
+  id               String       @id @default(uuid())
+  organizationId   String
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name             String
+  email            String?
+  phone            String?
+  avatarUrl        String?
+  customAttributes Json?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  conversations Conversation[]
+  tickets       Ticket[]
+
+  @@index([organizationId, email])
+  @@map("customers")
+}
+
+model Conversation {
+  id              String             @id @default(uuid())
+  organizationId  String
+  organization    Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  workspaceId     String?
+  workspace       Workspace?         @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  inboxId         String
+  inbox           Inbox              @relation(fields: [inboxId], references: [id], onDelete: Cascade)
+  customerId      String
+  customer        Customer           @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  assigneeId      String?
+  assignee        User?              @relation("AssignedAgent", fields: [assigneeId], references: [id], onDelete: SetNull)
+  teamId          String?
+  team            Team?              @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  status          ConversationStatus @default(OPEN)
+  priority        Priority           @default(MEDIUM)
+  firstResponseAt DateTime?
+  resolvedAt      DateTime?
+  lastMessageAt   DateTime           @default(now())
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  messages Message[]
+  tickets  Ticket[]
+
+  @@index([organizationId, status, createdAt])
+  @@index([organizationId, assigneeId])
+  @@map("conversations")
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  organizationId String
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderType     SenderType
+  senderId       String?
+  senderName     String?
+  messageType    MessageType  @default(PUBLIC_REPLY)
+  content        String
+  createdAt      DateTime     @default(now())
+
+  attachments Attachment[]
+
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+model Attachment {
+  id         String   @id @default(uuid())
+  messageId  String
+  message    Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  fileName   String
+  fileSize   Int
+  mimeType   String
+  storageKey String
+  url        String
+  createdAt  DateTime @default(now())
+
+  @@map("attachments")
+}
+
+model Ticket {
+  id             String       @id @default(uuid())
+  ticketNumber   Int
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversationId String?
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  customerId     String
+  customer       Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  assigneeId     String?
+  assignee       User?        @relation("AssignedTicketAgent", fields: [assigneeId], references: [id], onDelete: SetNull)
+  teamId         String?
+  team           Team?        @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  title          String
+  description    String
+  status         TicketStatus @default(NEW)
+  priority       Priority     @default(MEDIUM)
+  dueAt          DateTime?
+  resolvedAt     DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  comments TicketComment[]
+
+  @@unique([organizationId, ticketNumber])
+  @@index([organizationId, status])
+  @@map("tickets")
+}
+
+model TicketComment {
+  id         String   @id @default(uuid())
+  ticketId   String
+  ticket     Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content    String
+  isInternal Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  @@map("ticket_comments")
+}
+
+model Category {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  slug           String
+  description    String?
+  orderIndex     Int          @default(0)
+  createdAt      DateTime     @default(now())
+
+  articles Article[]
+
+  @@unique([organizationId, slug])
+  @@map("categories")
+}
+
+model Article {
+  id             String        @id @default(uuid())
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  categoryId     String
+  category       Category      @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  authorId       String
+  author         User          @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  title          String
+  slug           String
+  content        String
+  status         ArticleStatus @default(DRAFT)
+  viewCount      Int           @default(0)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@unique([organizationId, slug])
+  @@index([organizationId, status])
+  @@map("articles")
+}
+
+model AutomationRule {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  isActive       Boolean      @default(true)
+  triggerEvent   String
+  conditions     Json
+  actions        Json
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([organizationId, triggerEvent])
+  @@map("automation_rules")
+}
+
+model AuditEvent {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String?
+  action         String
+  entityType     String
+  entityId       String?
+  metadata       Json?
+  ipAddress      String?
+  createdAt      DateTime     @default(now())
+
+  @@index([organizationId, createdAt])
+  @@map("audit_events")
+}

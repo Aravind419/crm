@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Databases & local storage
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+prisma/dev.db
+
+# Logs & Playwright
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.playwright-mcp/
+test-results/
+playwright-report/
+
+# OS files
+.DS_Store
+Thumbs.db
