@@ -1353,12 +1353,22 @@ async function runSecurityRemediationSuite() {
     }
 
     // Reliable server & connection teardown
+    try {
+      const { closeSocketService } = await import('../src/services/socket.service');
+      await closeSocketService();
+      const { closeRedis } = await import('../src/services/redis.service');
+      await closeRedis();
+    } catch (_) {}
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await prisma.$disconnect();
   }
 }
 
-runSecurityRemediationSuite().catch((err) => {
-  console.error('\n❌ Security Remediation Test Suite Failed:', err);
-  process.exit(1);
-});
+runSecurityRemediationSuite()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error('\n❌ Security Remediation Test Suite Failed:', err);
+    process.exit(1);
+  });

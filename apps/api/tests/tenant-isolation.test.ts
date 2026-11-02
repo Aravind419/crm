@@ -183,20 +183,30 @@ async function runTenantIsolationTests() {
     if (starlightConv?.id) {
       await prisma.conversation.delete({ where: { id: starlightConv.id } }).catch(() => {});
     }
+    try {
+      const { closeSocketService } = await import('../src/services/socket.service');
+      await closeSocketService();
+      const { closeRedis } = await import('../src/services/redis.service');
+      await closeRedis();
+    } catch (_) {}
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await prisma.$disconnect();
   }
 }
 
-runTenantIsolationTests().catch((err) => {
-  console.error('\n❌ Tenant Isolation Security Tests Failed:', err);
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    try {
-      require('fs').appendFileSync(
-        process.env.GITHUB_STEP_SUMMARY,
-        `\n### ❌ Tenant Isolation Failure\n\`\`\`\n${err.stack || err.message}\n\`\`\`\n`
-      );
-    } catch (_) {}
-  }
-  process.exit(1);
-});
+runTenantIsolationTests()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error('\n❌ Tenant Isolation Security Tests Failed:', err);
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      try {
+        require('fs').appendFileSync(
+          process.env.GITHUB_STEP_SUMMARY,
+          `\n### ❌ Tenant Isolation Failure\n\`\`\`\n${err.stack || err.message}\n\`\`\`\n`
+        );
+      } catch (_) {}
+    }
+    process.exit(1);
+  });

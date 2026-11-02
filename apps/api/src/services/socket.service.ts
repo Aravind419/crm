@@ -8,6 +8,8 @@ import { config } from '../config';
 import { prisma } from '../prisma';
 
 let io: SocketIOServer | null = null;
+let pubClient: Redis | null = null;
+let subClient: Redis | null = null;
 
 export function initSocketService(server: HttpServer): SocketIOServer {
   io = new SocketIOServer(server, {
@@ -46,8 +48,8 @@ export function initSocketService(server: HttpServer): SocketIOServer {
   // Attach Redis adapter for horizontal multi-instance Socket.IO clustering if configured
   if (config.redisUrl) {
     try {
-      const pubClient = new Redis(config.redisUrl, { lazyConnect: false });
-      const subClient = pubClient.duplicate();
+      pubClient = new Redis(config.redisUrl, { lazyConnect: false });
+      subClient = pubClient.duplicate();
       io.adapter(createAdapter(pubClient, subClient));
       console.log('[Socket.IO] Attached Redis adapter for multi-instance distributed room clustering');
     } catch (adapterErr: any) {
@@ -348,6 +350,21 @@ export function disconnectUserSockets(userId: string): void {
         socket.disconnect(true);
       } catch (_) {}
     }
+  }
+}
+
+export async function closeSocketService(): Promise<void> {
+  if (pubClient) {
+    await pubClient.quit().catch(() => pubClient?.disconnect());
+    pubClient = null;
+  }
+  if (subClient) {
+    await subClient.quit().catch(() => subClient?.disconnect());
+    subClient = null;
+  }
+  if (io) {
+    io.close();
+    io = null;
   }
 }
 

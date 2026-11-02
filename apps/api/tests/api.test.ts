@@ -212,20 +212,30 @@ async function runTests() {
 
     console.log('\n🎉 ALL CORE API & SECURITY REMEDIATION TESTS PASSED!');
   } finally {
+    try {
+      const { closeSocketService } = await import('../src/services/socket.service');
+      await closeSocketService();
+      const { closeRedis } = await import('../src/services/redis.service');
+      await closeRedis();
+    } catch (_) {}
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await prisma.$disconnect();
   }
 }
 
-runTests().catch((err) => {
-  console.error('\n❌ Test Suite Failed:', err);
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    try {
-      require('fs').appendFileSync(
-        process.env.GITHUB_STEP_SUMMARY,
-        `\n### ❌ API Test Suite Failure\n\`\`\`\n${err.stack || err.message}\n\`\`\`\n`
-      );
-    } catch (_) {}
-  }
-  process.exit(1);
-});
+runTests()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error('\n❌ Test Suite Failed:', err);
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      try {
+        require('fs').appendFileSync(
+          process.env.GITHUB_STEP_SUMMARY,
+          `\n### ❌ API Test Suite Failure\n\`\`\`\n${err.stack || err.message}\n\`\`\`\n`
+        );
+      } catch (_) {}
+    }
+    process.exit(1);
+  });
