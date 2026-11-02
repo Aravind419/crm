@@ -56,6 +56,9 @@ async function runTenantIsolationTests() {
     });
   });
 
+  let starlightConv: any = null;
+  let starlightTicket: any = null;
+
   try {
     // 1. Authenticate Org A (Alex from Acme)
     const loginA = await request({
@@ -97,7 +100,7 @@ async function runTenantIsolationTests() {
         },
       }));
 
-    const starlightConv = await prisma.conversation.create({
+    starlightConv = await prisma.conversation.create({
       data: {
         organizationId: starlightOrg.id,
         inboxId: starlightInbox.id,
@@ -107,7 +110,7 @@ async function runTenantIsolationTests() {
     });
 
     const randomTicketNum = Math.floor(Math.random() * 800000) + 10000;
-    const starlightTicket = await prisma.ticket.create({
+    starlightTicket = await prisma.ticket.create({
       data: {
         ticketNumber: randomTicketNum,
         organizationId: starlightOrg.id,
@@ -174,6 +177,12 @@ async function runTenantIsolationTests() {
 
     console.log('\n🛡️ ALL TENANT ISOLATION SECURITY TESTS PASSED! ZERO DATA LEAKAGE DETECTED.');
   } finally {
+    if (starlightTicket?.id) {
+      await prisma.ticket.delete({ where: { id: starlightTicket.id } }).catch(() => {});
+    }
+    if (starlightConv?.id) {
+      await prisma.conversation.delete({ where: { id: starlightConv.id } }).catch(() => {});
+    }
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await prisma.$disconnect();
   }
