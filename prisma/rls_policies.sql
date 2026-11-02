@@ -17,6 +17,16 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO supportos_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO supportos_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO supportos_app;
 
+-- Grant role membership so connecting sessions can switch roles via SET ROLE
+GRANT supportos_app TO CURRENT_USER;
+DO $$
+BEGIN
+  IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'supportos_user') THEN
+    GRANT supportos_app TO supportos_user;
+  END IF;
+END
+$$;
+
 -- 2. Enable RLS on core tenant-owned entities
 ALTER TABLE "conversations" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "messages" ENABLE ROW LEVEL SECURITY;

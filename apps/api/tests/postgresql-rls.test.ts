@@ -64,6 +64,7 @@ async function runPostgresRlsTests() {
 
     // 4. Test RLS Read Isolation in a Transaction under unprivileged role supportos_app
     console.log('\n3. Testing PostgreSQL RLS Read Isolation under non-superuser role...');
+    await prisma.$executeRawUnsafe(`GRANT supportos_app TO CURRENT_USER;`).catch(() => {});
     await prisma.$transaction(async (tx) => {
       // Switch to unprivileged application role subject to RLS
       await tx.$executeRawUnsafe(`SET LOCAL ROLE supportos_app;`);
@@ -141,10 +142,14 @@ async function runPostgresRlsTests() {
 }
 
 if (require.main === module) {
-  runPostgresRlsTests().catch((err) => {
-    console.error('❌ PostgreSQL RLS Test Failure:', err);
-    process.exit(1);
-  });
+  runPostgresRlsTests()
+    .then(() => {
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error('❌ PostgreSQL RLS Test Failure:', err);
+      process.exit(1);
+    });
 }
 
 export { runPostgresRlsTests };
