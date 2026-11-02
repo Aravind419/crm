@@ -1,11 +1,10 @@
 /**
  * SupportOS Embeddable Live Chat Widget (supportos.js)
- * High-performance, zero-dependency embeddable script for customer websites.
+ * Standalone, zero-dependency embeddable script for customer websites.
  */
 (function () {
   'use strict';
 
-  // Read configuration from the current script tag
   const currentScript =
     document.currentScript ||
     (function () {
@@ -13,18 +12,12 @@
       return scripts[scripts.length - 1];
     })();
 
-  const inboxKey = currentScript?.getAttribute('data-inbox-key') || window.SUPPORTOS_INBOX_KEY;
+  const inboxKey = currentScript?.getAttribute('data-inbox-key') || window.SUPPORTOS_INBOX_KEY || 'inbox_acme_live_49f82d';
   const apiUrl =
     currentScript?.getAttribute('data-api-url') ||
     window.SUPPORTOS_API_URL ||
     'http://localhost:4000';
 
-  if (!inboxKey) {
-    console.warn('[SupportOS] Widget disabled: missing data-inbox-key attribute.');
-    return;
-  }
-
-  // Session state storage
   const STORAGE_KEY = `supportos_session_${inboxKey}`;
   let sessionState = {
     conversationId: null,
@@ -47,10 +40,10 @@
 
   let isOpen = false;
   let inboxConfig = {
-    name: 'Live Chat',
+    name: 'Website Live Support',
     widgetColor: '#2563EB',
-    greeting: 'Hi there! How can we help you today?',
-    organizationName: 'Support',
+    greeting: 'Hi there! How can our team assist you today?',
+    organizationName: 'SupportOS',
   };
   let messageList = [];
   let pollInterval = null;
@@ -278,7 +271,6 @@
       </button>
     </div>
     <div id="supportos-body-container" style="display: flex; flex-direction: column; flex: 1; overflow: hidden;">
-      <!-- Welcome Form or Message Stream will render here -->
     </div>
     <div class="supportos-powered-by">
       Powered by <strong>SupportOS</strong>
@@ -292,7 +284,6 @@
   const bodyContainer = chatWindow.querySelector('#supportos-body-container');
   const closeBtn = chatWindow.querySelector('#supportos-close-btn');
 
-  // Toggle Window
   function toggleChat() {
     isOpen = !isOpen;
     chatWindow.style.display = isOpen ? 'flex' : 'none';
@@ -312,7 +303,6 @@
   launcher.addEventListener('click', toggleChat);
   closeBtn.addEventListener('click', toggleChat);
 
-  // Fetch configuration
   async function loadConfig() {
     try {
       const res = await fetch(`${apiUrl}/api/v1/public/inbox-config/${inboxKey}`);
@@ -327,13 +317,10 @@
         const titleEl = chatWindow.querySelector('#supportos-title');
         if (titleEl) titleEl.innerText = inboxConfig.name || 'Support';
       }
-    } catch (e) {
-      console.warn('[SupportOS] Could not reach support API server.');
-    }
+    } catch (e) {}
   }
   loadConfig();
 
-  // Render Pre-Chat / Welcome Form
   function renderWelcomeForm() {
     bodyContainer.innerHTML = `
       <div class="supportos-welcome-form">
@@ -395,12 +382,11 @@
     });
   }
 
-  // Render Message Stream
   function renderMessageStream() {
     bodyContainer.innerHTML = `
       <div class="supportos-messages-container" id="supportos-messages-list">
         <div style="text-align: center; color: #94a3b8; font-size: 13px; margin: 12px 0;">
-          Conversation started
+          Conversation active
         </div>
       </div>
       <div class="supportos-composer">
@@ -423,7 +409,6 @@
 
       input.value = '';
 
-      // Optimistic append
       messageList.push({
         id: 'opt_' + Date.now(),
         senderType: 'CUSTOMER',
@@ -436,10 +421,14 @@
       try {
         await fetch(`${apiUrl}/api/v1/public/conversations/${sessionState.conversationId}/messages`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-visitor-token': sessionState.visitorToken || '',
+          },
           body: JSON.stringify({
             message: text,
             senderName: sessionState.customerName || 'You',
+            visitorToken: sessionState.visitorToken,
           }),
         });
         fetchMessages();
@@ -454,11 +443,14 @@
     });
   }
 
-  // Fetch Message History
   async function fetchMessages() {
     if (!sessionState.conversationId) return;
     try {
-      const res = await fetch(`${apiUrl}/api/v1/public/conversations/${sessionState.conversationId}`);
+      const res = await fetch(`${apiUrl}/api/v1/public/conversations/${sessionState.conversationId}`, {
+        headers: {
+          'x-visitor-token': sessionState.visitorToken || '',
+        },
+      });
       if (res.ok) {
         const data = await res.json();
         messageList = data.conversation.messages || [];
@@ -510,6 +502,4 @@
       pollInterval = null;
     }
   }
-
-  console.log('[SupportOS] Live chat widget initialized.');
 })();

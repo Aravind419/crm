@@ -102,9 +102,10 @@ async function runTenantIsolationTests() {
       },
     });
 
+    const randomTicketNum = Math.floor(Math.random() * 800000) + 10000;
     const starlightTicket = await prisma.ticket.create({
       data: {
-        ticketNumber: 9999,
+        ticketNumber: randomTicketNum,
         organizationId: starlightOrg.id,
         customerId: starlightCustomer.id,
         title: 'Starlight Confidential Internal Ticket',

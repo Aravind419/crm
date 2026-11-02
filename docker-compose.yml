@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: supportos_admin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-supportos_secure_password_2026}
+      POSTGRES_DB: supportos
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: always
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://supportos_admin:${POSTGRES_PASSWORD:-supportos_secure_password_2026}@postgres:5432/supportos?schema=public
+      JWT_SECRET: ${JWT_SECRET:-supportos_prod_secret_key_2026_change}
+      CORS_ORIGIN: http://localhost:3000
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "4000:4000"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: always
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+      NEXT_PUBLIC_SOCKET_URL: http://localhost:4000
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:
+  redisdata:

@@ -46,7 +46,7 @@ function request(options: {
 }
 
 async function runTests() {
-  console.log('🧪 Starting SupportOS API Integration Test Suite...\n');
+  console.log('🧪 Starting SupportOS API Integration & Security Test Suite...\n');
 
   await new Promise<void>((resolve) => {
     server.listen(TEST_PORT, () => {
@@ -63,8 +63,8 @@ async function runTests() {
     assert.strictEqual(health.data.product, 'SupportOS');
     console.log('   ✅ Health Check passed.');
 
-    // 2. Authentication: Login with seeded credentials
-    console.log('2. Testing Agent Login (alex@acme.com)...');
+    // 2. Authentication: Login with bcrypt / secure credentials
+    console.log('2. Testing Agent Login with secure authentication (alex@acme.com)...');
     const login = await request({
       method: 'POST',
       path: '/api/v1/auth/login',
@@ -93,7 +93,7 @@ async function runTests() {
     const convs = await request({ method: 'GET', path: '/api/v1/conversations', headers: authHeaders });
     assert.strictEqual(convs.status, 200);
     assert.ok(Array.isArray(convs.data.conversations));
-    assert.ok(convs.data.conversations.length >= 1, 'Should have seeded conversations');
+    assert.ok(convs.data.conversations.length >= 1, 'Should have active conversations');
     const testConvId = convs.data.conversations[0].id;
     console.log(`   ✅ Found ${convs.data.conversations.length} active conversations.`);
 
@@ -133,8 +133,8 @@ async function runTests() {
       body: {
         conversationId: testConvId,
         customerId: convs.data.conversations[0].customerId,
-        title: 'Automated Test Ticket - Ingestion Verification',
-        description: 'Verifying end-to-end ticket lifecycle under test automation.',
+        title: 'Audit Verification Ticket',
+        description: 'Verifying end-to-end ticket lifecycle post-audit.',
         priority: 'HIGH',
       },
     });
@@ -142,7 +142,6 @@ async function runTests() {
     assert.ok(newTicket.data.ticket.ticketNumber >= 1000);
     const ticketId = newTicket.data.ticket.id;
 
-    // Update Ticket Status to RESOLVED
     const updateTicket = await request({
       method: 'PATCH',
       path: `/api/v1/tickets/${ticketId}`,
@@ -153,40 +152,43 @@ async function runTests() {
     assert.strictEqual(updateTicket.data.ticket.status, 'RESOLVED');
     console.log(`   ✅ Ticket #${newTicket.data.ticket.ticketNumber} created and resolved.`);
 
-    // 7. Public Live Chat Widget Ingestion
-    console.log('7. Testing Embeddable Widget Ingestion API...');
-    const widgetConfig = await request({
-      method: 'GET',
-      path: '/api/v1/public/inbox-config/inbox_acme_live_49f82d',
-    });
-    assert.strictEqual(widgetConfig.status, 200);
-    assert.strictEqual(widgetConfig.data.inbox.name, 'Website Live Chat');
-
-    // Visitor initiates conversation
+    // 7. Public Live Chat Widget Ingestion & Token Defense
+    console.log('7. Testing Embeddable Widget Ingestion & IDOR Defenses...');
+    const visitorSessionToken = 'vis_test_session_token_' + Date.now();
     const visitorConv = await request({
       method: 'POST',
       path: '/api/v1/public/conversations',
       body: {
         inboxKey: 'inbox_acme_live_49f82d',
-        name: 'Automated Test Visitor',
-        email: 'test.visitor@example.com',
-        message: 'Hello, need assistance with my billing invoice!',
+        visitorToken: visitorSessionToken,
+        name: 'Audit Visitor',
+        email: 'audit.visitor@example.com',
+        message: 'Hello, testing secure session isolation in widget!',
       },
     });
     assert.strictEqual(visitorConv.status, 201);
     const visitorConvId = visitorConv.data.conversationId;
 
-    // Visitor fetches messages: MUST NOT see internal notes!
-    const visitorMessages = await request({
+    // A) Rogue request with NO visitor token MUST be rejected with 403 Forbidden
+    const unauthFetch = await request({
       method: 'GET',
       path: `/api/v1/public/conversations/${visitorConvId}`,
     });
-    assert.strictEqual(visitorMessages.status, 200);
+    assert.strictEqual(unauthFetch.status, 403, 'Unauthorized conversation read without visitor token must be 403');
+    console.log('   ✅ IDOR defense verified: Unauthenticated conversation query blocked with 403.');
+
+    // B) Authorized request with correct visitor token MUST succeed
+    const authFetch = await request({
+      method: 'GET',
+      path: `/api/v1/public/conversations/${visitorConvId}`,
+      headers: { 'x-visitor-token': visitorSessionToken },
+    });
+    assert.strictEqual(authFetch.status, 200);
     assert.ok(
-      visitorMessages.data.conversation.messages.every((m: any) => m.messageType !== 'INTERNAL_NOTE'),
+      authFetch.data.conversation.messages.every((m: any) => m.messageType !== 'INTERNAL_NOTE'),
       'Visitors must never see internal notes'
     );
-    console.log('   ✅ Public widget ingestion & privacy boundary verified.');
+    console.log('   ✅ Authorized visitor query succeeded & internal note privacy boundary intact.');
 
     // 8. Public Knowledge Base Portal
     console.log('8. Testing Public Knowledge Base Portal...');
@@ -207,7 +209,7 @@ async function runTests() {
     assert.ok(Array.isArray(reports.data.agents));
     console.log(`   ✅ Reporting metrics verified (Total Conversations: ${reports.data.metrics.totalConversations}).`);
 
-    console.log('\n🎉 ALL CORE API TESTS PASSED SUCCESSFULLY!');
+    console.log('\n🎉 ALL CORE API & SECURITY REMEDIATION TESTS PASSED!');
   } finally {
     server.close();
   }

@@ -1,0 +1,28 @@
+# Production Dockerfile for SupportOS Web Client
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+COPY apps/web/package*.json ./apps/web/
+
+RUN npm install
+RUN cd apps/web && npm install
+
+COPY apps/web ./apps/web
+RUN cd apps/web && npm run build
+
+# Runtime Stage
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY --from=builder /app/apps/web/package.json ./apps/web/package.json
+COPY --from=builder /app/apps/web/node_modules ./apps/web/node_modules
+COPY --from=builder /app/apps/web/.next ./apps/web/.next
+COPY --from=builder /app/apps/web/public ./apps/web/public
+
+EXPOSE 3000
+
+CMD ["npm", "--prefix", "apps/web", "start"]

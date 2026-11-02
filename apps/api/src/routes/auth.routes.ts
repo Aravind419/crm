@@ -1,19 +1,29 @@
 import { Router, Request, Response } from 'express';
 import * as crypto from 'crypto';
 import * as jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import { prisma } from '../prisma';
 import { config } from '../config';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
 
 const router = Router();
 
-function hashPassword(password: string): string {
-  return crypto.createHash('sha256').update(password + 'supportos_salt_2026').digest('hex');
+export async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, 10);
+}
+
+export async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  // Check bcrypt hash
+  if (hash.startsWith('$2a$') || hash.startsWith('$2b$')) {
+    return bcrypt.compare(password, hash);
+  }
+  // Fallback for legacy seeded hashes
+  const legacyHash = crypto.createHash('sha256').update(password + 'supportos_salt_2026').digest('hex');
+  return legacyHash === hash;
 }
 
 /**
  * POST /api/v1/auth/signup
- * Register a new organization, owner account, default workspace, and inbox.
  */
 router.post('/signup', async (req: Request, res: Response): Promise<void> => {
   try {
@@ -26,14 +36,14 @@ router.post('/signup', async (req: Request, res: Response): Promise<void> => {
 
     const slug = (orgSlug || orgName.toLowerCase().replace(/[^a-z0-9]/g, '-')).replace(/--+/g, '-');
 
-    // Check slug uniqueness
     const existingOrg = await prisma.organization.findUnique({ where: { slug } });
     if (existingOrg) {
       res.status(409).json({ error: 'Conflict', message: 'Organization slug is already taken' });
       return;
     }
 
-    // Execute atomic transaction
+    const hashedPassword = await hashPassword(password);
+
     const result = await prisma.$transaction(async (tx) => {
       const organization = await tx.organization.create({
         data: {
@@ -48,7 +58,7 @@ router.post('/signup', async (req: Request, res: Response): Promise<void> => {
         data: {
           organizationId: organization.id,
           email: email.toLowerCase(),
-          passwordHash: hashPassword(password),
+          passwordHash: hashedPassword,
           firstName,
           lastName,
           role: 'OWNER',
@@ -116,7 +126,6 @@ router.post('/signup', async (req: Request, res: Response): Promise<void> => {
 
 /**
  * POST /api/v1/auth/login
- * Authenticate agent or administrator.
  */
 router.post('/login', async (req: Request, res: Response): Promise<void> => {
   try {
@@ -127,12 +136,9 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const hashedPassword = hashPassword(password);
-
     const user = await prisma.user.findFirst({
       where: {
         email: email.toLowerCase(),
-        passwordHash: hashedPassword,
       },
       include: {
         organization: true,
@@ -140,6 +146,12 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
     });
 
     if (!user) {
+      res.status(401).json({ error: 'Unauthorized', message: 'Invalid email or password' });
+      return;
+    }
+
+    const isMatch = await verifyPassword(password, user.passwordHash);
+    if (!isMatch) {
       res.status(401).json({ error: 'Unauthorized', message: 'Invalid email or password' });
       return;
     }
@@ -186,7 +198,6 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
 
 /**
  * GET /api/v1/auth/me
- * Returns current authenticated user and organization session profile.
  */
 router.get('/me', authMiddleware, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {

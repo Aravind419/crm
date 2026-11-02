@@ -2,6 +2,7 @@ import { Server as HttpServer } from 'http';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import * as jwt from 'jsonwebtoken';
 import { config } from '../config';
+import { prisma } from '../prisma';
 
 let io: SocketIOServer | null = null;
 
@@ -37,13 +38,12 @@ export function initSocketService(server: HttpServer): SocketIOServer {
     const conversationId = socket.handshake.auth?.conversationId || socket.handshake.query?.conversationId;
 
     if (visitorSession && conversationId) {
-      socket.data.visitorToken = visitorSession;
-      socket.data.conversationId = conversationId;
+      socket.data.visitorToken = String(visitorSession);
+      socket.data.conversationId = String(conversationId);
       socket.data.isVisitor = true;
       return next();
     }
 
-    // Allow connection for public polling
     next();
   });
 
@@ -54,22 +54,61 @@ export function initSocketService(server: HttpServer): SocketIOServer {
       console.log(`[Socket] Agent ${socket.data.userId} connected to room ${orgRoom}`);
     }
 
-    if (socket.data.conversationId) {
+    if (socket.data.isVisitor && socket.data.conversationId) {
       const convRoom = `conv:${socket.data.conversationId}`;
       socket.join(convRoom);
       console.log(`[Socket] Visitor joined thread room ${convRoom}`);
     }
 
-    // Agent or visitor joins specific conversation room to watch
-    socket.on('join:conversation', (conversationId: string) => {
-      socket.join(`conv:${conversationId}`);
+    // Secure conversation room join handler with strict tenant & ownership checks
+    socket.on('join:conversation', async (conversationId: string) => {
+      try {
+        if (!conversationId) return;
+
+        // Rule A: Authenticated Agents can only join conversations belonging to their organization
+        if (socket.data.isAgent && socket.data.organizationId) {
+          const conv = await prisma.conversation.findFirst({
+            where: {
+              id: conversationId,
+              organizationId: socket.data.organizationId,
+            },
+            select: { id: true },
+          });
+
+          if (conv) {
+            socket.join(`conv:${conversationId}`);
+            console.log(`[Socket] Agent ${socket.data.userId} authorized to join conv:${conversationId}`);
+          } else {
+            console.warn(`[Socket Security] Unauthorized agent conversation join attempt blocked for org ${socket.data.organizationId}`);
+            socket.emit('error:unauthorized', { message: 'Cross-tenant conversation access denied' });
+          }
+          return;
+        }
+
+        // Rule B: Visitors can ONLY join the conversation that matches their verified visitor session
+        if (socket.data.isVisitor && socket.data.conversationId) {
+          if (socket.data.conversationId === conversationId) {
+            socket.join(`conv:${conversationId}`);
+            console.log(`[Socket] Visitor authorized to join conv:${conversationId}`);
+          } else {
+            console.warn(`[Socket Security] Visitor attempted to join unauthorized conversation ${conversationId}`);
+            socket.emit('error:unauthorized', { message: 'Visitor cannot access other conversations' });
+          }
+          return;
+        }
+
+        // Rule C: Anonymous unauthenticated sockets cannot join conversation rooms
+        console.warn(`[Socket Security] Anonymous socket rejected from joining conv:${conversationId}`);
+        socket.emit('error:unauthorized', { message: 'Authentication required to join conversation rooms' });
+      } catch (err) {
+        console.error('[Socket Join Error]:', err);
+      }
     });
 
     socket.on('leave:conversation', (conversationId: string) => {
       socket.leave(`conv:${conversationId}`);
     });
 
-    // Typing indicators
     socket.on('typing:start', (data: { conversationId: string; senderName: string }) => {
       socket.to(`conv:${data.conversationId}`).emit('typing:indicator', {
         conversationId: data.conversationId,
@@ -85,9 +124,7 @@ export function initSocketService(server: HttpServer): SocketIOServer {
       });
     });
 
-    socket.on('disconnect', () => {
-      // Clean disconnect
-    });
+    socket.on('disconnect', () => {});
   });
 
   return io;

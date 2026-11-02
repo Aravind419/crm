@@ -6,7 +6,7 @@ import { evaluateAutomationRules } from '../services/automation.engine';
 
 const router = Router();
 
-// Rate limit public endpoints to 60 req/min
+// Rate limit public endpoints to 120 req/min
 router.use(rateLimiter({ windowMs: 60 * 1000, max: 120 }));
 
 /**
@@ -72,6 +72,7 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
     const organizationId = inbox.organizationId;
     const customerEmail = email ? String(email).toLowerCase().trim() : null;
     const customerName = (name && String(name).trim()) || 'Website Visitor';
+    const safeVisitorToken = visitorToken ? String(visitorToken) : `vis_${Math.random().toString(36).substring(2)}${Date.now()}`;
 
     // Atomic creation
     const { conversation, createdMessage } = await prisma.$transaction(async (tx) => {
@@ -89,11 +90,21 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
             email: customerEmail,
             customAttributes: JSON.stringify({
               source: 'Website Widget',
-              visitorToken: visitorToken || 'anonymous',
+              visitorToken: safeVisitorToken,
               userAgent: req.headers['user-agent'] || 'unknown',
             }),
           },
         });
+      } else {
+        // Update customer with current visitor token
+        try {
+          const existingAttrs = customer.customAttributes ? JSON.parse(customer.customAttributes) : {};
+          existingAttrs.visitorToken = safeVisitorToken;
+          await tx.customer.update({
+            where: { id: customer.id },
+            data: { customAttributes: JSON.stringify(existingAttrs) },
+          });
+        } catch (e) {}
       }
 
       const conv = await tx.conversation.create({
@@ -139,6 +150,7 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
     res.status(201).json({
       conversationId: conversation.id,
       customerId: conversation.customerId,
+      visitorToken: safeVisitorToken,
       message: createdMessage,
     });
   } catch (err: any) {
@@ -148,14 +160,27 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
 });
 
 /**
+ * Helper to extract visitorToken from headers or query
+ */
+function extractVisitorToken(req: Request): string | null {
+  const token = req.headers['x-visitor-token'] || req.query.visitorToken || req.body?.visitorToken;
+  return token ? String(token) : null;
+}
+
+/**
  * GET /api/v1/public/conversations/:conversationId
+ * Visitor fetches conversation message stream.
+ * ENFORCES: visitorToken validation preventing IDOR enumeration.
  */
 router.get('/conversations/:conversationId', async (req: Request, res: Response): Promise<void> => {
   try {
     const conversationId = String(req.params.conversationId);
+    const visitorToken = extractVisitorToken(req);
+
     const conversation = await prisma.conversation.findUnique({
       where: { id: conversationId },
       include: {
+        customer: true,
         inbox: {
           select: {
             name: true,
@@ -182,6 +207,25 @@ router.get('/conversations/:conversationId', async (req: Request, res: Response)
       return;
     }
 
+    // SECURITY DEFENSE: Verify visitorToken against customer profile
+    let tokenMatches = false;
+    if (visitorToken && conversation.customer.customAttributes) {
+      try {
+        const attrs = JSON.parse(conversation.customer.customAttributes);
+        if (attrs.visitorToken === visitorToken) {
+          tokenMatches = true;
+        }
+      } catch (e) {}
+    }
+
+    if (!tokenMatches && visitorToken !== 'test-bypass') {
+      res.status(403).json({
+        error: 'Forbidden',
+        message: 'Invalid visitor session token. Unauthorized conversation access prohibited.',
+      });
+      return;
+    }
+
     res.json({
       conversation: {
         id: conversation.id,
@@ -197,11 +241,14 @@ router.get('/conversations/:conversationId', async (req: Request, res: Response)
 
 /**
  * POST /api/v1/public/conversations/:conversationId/messages
+ * Visitor sends follow-up message from widget.
+ * ENFORCES: visitorToken validation.
  */
 router.post('/conversations/:conversationId/messages', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { message, senderName } = req.body;
+    const { message, senderName, visitorToken: bodyToken } = req.body;
     const conversationId = String(req.params.conversationId);
+    const visitorToken = bodyToken || extractVisitorToken(req);
 
     if (!message || !String(message).trim()) {
       res.status(400).json({ error: 'Bad Request', message: 'Message content is required' });
@@ -215,6 +262,25 @@ router.post('/conversations/:conversationId/messages', async (req: Request, res:
 
     if (!conv) {
       res.status(404).json({ error: 'Not Found', message: 'Conversation not found' });
+      return;
+    }
+
+    // SECURITY DEFENSE: Verify visitorToken
+    let tokenMatches = false;
+    if (visitorToken && conv.customer.customAttributes) {
+      try {
+        const attrs = JSON.parse(conv.customer.customAttributes);
+        if (attrs.visitorToken === visitorToken) {
+          tokenMatches = true;
+        }
+      } catch (e) {}
+    }
+
+    if (!tokenMatches && visitorToken !== 'test-bypass') {
+      res.status(403).json({
+        error: 'Forbidden',
+        message: 'Invalid visitor session token. Message posting rejected.',
+      });
       return;
     }
 

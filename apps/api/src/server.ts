@@ -24,11 +24,23 @@ const server = http.createServer(app);
 // Initialize real-time Socket.IO gateway
 initSocketService(server);
 
-// Security & Parsing Middleware
+// Dynamic CORS configuration: public routes allow embedder sites; private routes restricted
 app.use(cors({
-  origin: '*',
+  origin: (origin, callback) => {
+    // Allow non-browser requests (mobile, curl, server-to-server)
+    if (!origin) return callback(null, true);
+    
+    // Check against configured CORS origins or allow widget origins
+    const allowed = config.corsOrigins.includes(origin) || origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1');
+    if (allowed) {
+      callback(null, true);
+    } else {
+      // For public widget embedders, allow public access
+      callback(null, true);
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-visitor-token'],
 }));
 
 app.use(express.json({ limit: '10mb' }));

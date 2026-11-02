@@ -421,10 +421,14 @@
       try {
         await fetch(`${apiUrl}/api/v1/public/conversations/${sessionState.conversationId}/messages`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-visitor-token': sessionState.visitorToken || '',
+          },
           body: JSON.stringify({
             message: text,
             senderName: sessionState.customerName || 'You',
+            visitorToken: sessionState.visitorToken,
           }),
         });
         fetchMessages();
@@ -442,7 +446,11 @@
   async function fetchMessages() {
     if (!sessionState.conversationId) return;
     try {
-      const res = await fetch(`${apiUrl}/api/v1/public/conversations/${sessionState.conversationId}`);
+      const res = await fetch(`${apiUrl}/api/v1/public/conversations/${sessionState.conversationId}`, {
+        headers: {
+          'x-visitor-token': sessionState.visitorToken || '',
+        },
+      });
       if (res.ok) {
         const data = await res.json();
         messageList = data.conversation.messages || [];
