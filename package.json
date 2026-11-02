@@ -16,7 +16,8 @@
     "db:seed": "tsx prisma/seed.ts",
     "test": "npm --prefix apps/api test",
     "test:security": "npm --prefix apps/api run test:security",
-    "audit:check": "node scripts/audit-check.js"
+    "audit:check": "node scripts/audit-check.js",
+    "audit:runtime": "tsx scripts/runtime-audit-suite.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

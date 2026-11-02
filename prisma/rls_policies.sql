@@ -12,13 +12,14 @@ BEGIN
 END
 $$;
 
--- Grant schema and table access to supportos_app
-GRANT ALL ON SCHEMA public TO supportos_app;
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO supportos_app;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO supportos_app;
-GRANT ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA public TO supportos_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO supportos_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO supportos_app;
+-- Grant schema and table access to supportos_app (Least Privilege: SELECT, INSERT, UPDATE, DELETE only)
+GRANT USAGE ON SCHEMA public TO supportos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO supportos_app;
+REVOKE ALL PRIVILEGES ON TABLE "_prisma_migrations" FROM supportos_app;
+REVOKE TRUNCATE, TRIGGER, REFERENCES ON ALL TABLES IN SCHEMA public FROM supportos_app;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO supportos_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO supportos_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO supportos_app;
 
 -- 2. Enable & Force Row Level Security on all tenant-owned entities
 ALTER TABLE "organizations" ENABLE ROW LEVEL SECURITY;

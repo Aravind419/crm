@@ -106,15 +106,72 @@ volumes:
 
 ---
 
-## 4. Database Migrations & Initial Setup
+## 4. Database Roles & Migration Setup
+
+For enterprise zero-trust database security, database administration/migrations and application runtime should execute under separate database credentials:
+
+- **Migration / DDL Role (`DIRECT_URL`)**: Owns the database schema and executes migrations via direct compute sessions with advisory locks (`_prisma_migrations`).
+- **Application Runtime Role (`DATABASE_URL`)**: Uses restricted unprivileged role `supportos_app` (`NOSUPERUSER NOBYPASSRLS`) connecting through pgBouncer transaction pooling. Possesses strictly `SELECT, INSERT, UPDATE, DELETE` on application tables and zero access to `_prisma_migrations`.
 
 ```bash
-# 1. Run database schema push against target PostgreSQL database
-npx prisma db push --schema=prisma/schema.postgresql.prisma
+# 1. Apply migrations using canonical Prisma migration deployer
+npx prisma migrate deploy --schema=prisma/schema.postgresql.prisma
 
-# 2. Apply PostgreSQL Row-Level Security (RLS) policies
-psql -h postgres -U supportos_admin -d supportos -f prisma/rls_policies.sql
+# 2. Apply PostgreSQL Row-Level Security (RLS) policies and least-privilege role definitions
+psql "$DIRECT_URL" -v ON_ERROR_STOP=1 -f prisma/rls_policies.sql
 
 # 3. Seed initial master organization and administrative accounts
 npx tsx prisma/seed.ts
 ```
+
+---
+
+## 5. Enterprise Backup, Disaster Recovery & High Availability
+
+### 5.1 Automated Point-in-Time Recovery (PITR)
+- **Continuous Write-Ahead Logging (WAL)**: Production PostgreSQL instances must retain WAL archives allowing Point-in-Time Recovery to any second within a 30-day retention window.
+- **Neon Cloud PITR**: When hosted on Neon Serverless PostgreSQL, PITR is natively supported via instant point-in-time branch creation. In the event of catastrophic data corruption or human error, a branch can be restored instantaneously to any historical timestamp without service interruption.
+
+### 5.2 Automated Logical Backups (Daily Snapshots)
+In addition to WAL archiving, an automated scheduled job must export and encrypt daily logical dumps:
+
+```bash
+# Daily logical backup script (cron / Kubernetes CronJob)
+BACKUP_TIMESTAMP=$(date -u +"%Y%m%d_%H%M%SZ")
+BACKUP_FILE="/backups/supportos_backup_${BACKUP_TIMESTAMP}.dump"
+
+pg_dump "$DIRECT_URL" \
+  --format=custom \
+  --compress=9 \
+  --no-owner \
+  --no-privileges \
+  --file="$BACKUP_FILE"
+
+# Encrypt backup with AES-256 and replicate to offsite cold object storage (AWS S3 Glacier / Cloudflare R2)
+gpg --symmetric --cipher-algo AES256 --batch --yes --passphrase "$BACKUP_ENCRYPTION_KEY" "$BACKUP_FILE"
+aws s3 cp "${BACKUP_FILE}.gpg" "s3://${BACKUP_S3_BUCKET}/postgres/supportos_${BACKUP_TIMESTAMP}.dump.gpg"
+```
+
+### 5.3 Disaster Recovery Runbook (RTO & RPO Objectives)
+- **Target Recovery Point Objective (RPO)**: < 5 minutes (via continuous WAL streaming).
+- **Target Recovery Time Objective (RTO)**: < 30 minutes (automated container restart and branch failover).
+
+**Restoration Procedure:**
+1. Provision target clean PostgreSQL cluster with matching major engine version (PostgreSQL 16+).
+2. Decrypt offsite backup:
+   ```bash
+   gpg --decrypt --batch --passphrase "$BACKUP_ENCRYPTION_KEY" supportos_backup.dump.gpg > supportos_backup.dump
+   ```
+3. Restore database schema and records:
+   ```bash
+   pg_restore --clean --if-exists --no-owner -d "$RESTORE_DIRECT_URL" supportos_backup.dump
+   ```
+4. Re-apply Row-Level Security policies and unprivileged role definitions:
+   ```bash
+   psql "$RESTORE_DIRECT_URL" -v ON_ERROR_STOP=1 -f prisma/rls_policies.sql
+   ```
+5. Verify application data integrity:
+   ```bash
+   npm --prefix apps/api run test:postgres-rls
+   npm --prefix apps/api run test:security
+   ```

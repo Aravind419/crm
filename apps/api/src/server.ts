@@ -1,6 +1,6 @@
 import express from 'express';
 import http from 'http';
-import { config } from './config';
+import { config, validateSecurityConfig } from './config';
 import { initSocketService } from './services/socket.service';
 
 // Route handlers
@@ -146,6 +146,17 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 
 // Start server if executed directly
 if (require.main === module) {
+  // Fail closed immediately on boot if production security criteria or required distributed backends are unmet
+  if (config.nodeEnv === 'production' || config.requireRedis) {
+    try {
+      validateSecurityConfig();
+      console.log('🛡️ Production security configuration verified successfully');
+    } catch (configErr: any) {
+      console.error(configErr.message);
+      process.exit(1);
+    }
+  }
+
   server.listen(config.port, () => {
     console.log(`🚀 SupportOS API Server running on http://localhost:${config.port}`);
     console.log(`⚡ Real-Time Socket.IO Gateway active`);
