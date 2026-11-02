@@ -38,8 +38,8 @@ export async function evaluateAutomationRules(
       let actions: AutomationAction = {};
 
       try {
-        conditions = JSON.parse(rule.conditions);
-        actions = JSON.parse(rule.actions);
+        conditions = typeof rule.conditions === 'string' ? JSON.parse(rule.conditions) : (rule.conditions as any || {});
+        actions = typeof rule.actions === 'string' ? JSON.parse(rule.actions) : (rule.actions as any || {});
       } catch (err) {
         continue;
       }

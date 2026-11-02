@@ -12,6 +12,7 @@ datasource db {
 enum Plan {
   FREE
   TEAM
+  GROWTH
   BUSINESS
   ENTERPRISE
 }

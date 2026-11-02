@@ -129,8 +129,8 @@ router.post('/billing/webhook', async (req: Request, res: Response): Promise<voi
         await tx.organization.update({
           where: { id: organizationId },
           data: {
-            plan: String(plan).toUpperCase(),
-            ...(status ? { status: String(status).toUpperCase() } : {}),
+            plan: String(plan).toUpperCase() as any,
+            ...(status ? { status: String(status).toUpperCase() as any } : {}),
           },
         });
 

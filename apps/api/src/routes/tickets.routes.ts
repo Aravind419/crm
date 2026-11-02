@@ -138,8 +138,8 @@ router.post('/', async (req: AuthenticatedRequest, res: Response): Promise<void>
           teamId: teamId ? String(teamId) : null,
           title: String(title),
           description: String(description),
-          priority: priority ? String(priority).toUpperCase() : 'MEDIUM',
-          status: 'NEW',
+          priority: (priority ? String(priority).toUpperCase() : 'MEDIUM') as any,
+          status: 'NEW' as any,
           dueAt: dueAt ? new Date(dueAt) : null,
         },
         include: {

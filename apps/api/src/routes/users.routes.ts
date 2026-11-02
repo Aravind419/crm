@@ -189,7 +189,7 @@ router.patch('/:id/status', requireRoles(['OWNER', 'ADMIN']), async (req: Authen
     const updatedUser = await prisma.$transaction(async (tx) => {
       const u = await tx.user.update({
         where: { id: targetUser.id },
-        data: { status: String(status).toUpperCase() },
+        data: { status: String(status).toUpperCase() as any },
         select: {
           id: true,
           email: true,

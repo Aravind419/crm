@@ -183,11 +183,15 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
         });
       } else {
         try {
-          const existingAttrs = customer.customAttributes ? JSON.parse(customer.customAttributes) : {};
+          const rawAttrs = customer.customAttributes;
+          const existingAttrs =
+            typeof rawAttrs === 'string'
+              ? JSON.parse(rawAttrs)
+              : (rawAttrs as any) || {};
           delete existingAttrs.visitorToken; // Scrub any legacy token
           await tx.customer.update({
             where: { id: customer.id },
-            data: { customAttributes: JSON.stringify(existingAttrs) },
+            data: { customAttributes: typeof rawAttrs === 'string' ? JSON.stringify(existingAttrs) : existingAttrs },
           });
         } catch (e) {}
       }
