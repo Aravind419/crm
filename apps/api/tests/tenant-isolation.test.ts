@@ -85,13 +85,17 @@ async function runTenantIsolationTests() {
     const starlightInbox = await prisma.inbox.findFirst({ where: { organizationId: starlightOrg.id } });
     assert.ok(starlightInbox, 'Starlight inbox must exist');
 
-    const starlightCustomer = await prisma.customer.create({
-      data: {
-        organizationId: starlightOrg.id,
-        name: 'Starlight Confidential Customer',
-        email: 'secret@starlight-shopper.com',
-      },
-    });
+    const starlightCustomer =
+      (await prisma.customer.findFirst({
+        where: { organizationId: starlightOrg.id, email: 'secret@starlight-shopper.com' },
+      })) ||
+      (await prisma.customer.create({
+        data: {
+          organizationId: starlightOrg.id,
+          name: 'Starlight Confidential Customer',
+          email: `secret_${Date.now()}@starlight-shopper.com`,
+        },
+      }));
 
     const starlightConv = await prisma.conversation.create({
       data: {
