@@ -190,5 +190,13 @@ async function runTenantIsolationTests() {
 
 runTenantIsolationTests().catch((err) => {
   console.error('\n❌ Tenant Isolation Security Tests Failed:', err);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    try {
+      require('fs').appendFileSync(
+        process.env.GITHUB_STEP_SUMMARY,
+        `\n### ❌ Tenant Isolation Failure\n\`\`\`\n${err.stack || err.message}\n\`\`\`\n`
+      );
+    } catch (_) {}
+  }
   process.exit(1);
 });

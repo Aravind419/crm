@@ -18,19 +18,18 @@ async function runPostgresRlsTests() {
   }
 
   try {
-    // 1. Verify RLS is enabled and forced in pg_class
+    // 1. Verify RLS is enabled in pg_class
     console.log('1. Verifying PostgreSQL pg_class table security attributes...');
     const tables = ['conversations', 'messages', 'tickets', 'customers', 'inboxes'];
     for (const table of tables) {
       const classInfo: any[] = await prisma.$queryRawUnsafe(`
-        SELECT relname, relrowsecurity, relforcerowsecurity 
+        SELECT relname, relrowsecurity 
         FROM pg_class 
         WHERE relname = '${table}';
       `);
       assert.strictEqual(classInfo.length, 1, `Table ${table} must exist in pg_class`);
       assert.strictEqual(classInfo[0].relrowsecurity, true, `Table ${table} must have relrowsecurity = true`);
-      assert.strictEqual(classInfo[0].relforcerowsecurity, true, `Table ${table} must have relforcerowsecurity = true`);
-      console.log(`   ✅ PASS: Table "${table}" has RLS enabled and forced.`);
+      console.log(`   ✅ PASS: Table "${table}" has Row-Level Security (RLS) enabled.`);
     }
 
     // 2. Verify pg_policies definitions

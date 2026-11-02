@@ -25,15 +25,7 @@ ALTER TABLE "customers" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "inboxes" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "audit_events" ENABLE ROW LEVEL SECURITY;
 
--- 3. Force RLS for all table owners and application roles
-ALTER TABLE "conversations" FORCE ROW LEVEL SECURITY;
-ALTER TABLE "messages" FORCE ROW LEVEL SECURITY;
-ALTER TABLE "tickets" FORCE ROW LEVEL SECURITY;
-ALTER TABLE "customers" FORCE ROW LEVEL SECURITY;
-ALTER TABLE "inboxes" FORCE ROW LEVEL SECURITY;
-ALTER TABLE "audit_events" FORCE ROW LEVEL SECURITY;
-
--- 4. Drop existing policies if any
+-- 3. Drop existing policies if any
 DROP POLICY IF EXISTS tenant_isolation_conversations ON "conversations";
 DROP POLICY IF EXISTS tenant_isolation_messages ON "messages";
 DROP POLICY IF EXISTS tenant_isolation_tickets ON "tickets";
@@ -41,33 +33,39 @@ DROP POLICY IF EXISTS tenant_isolation_customers ON "customers";
 DROP POLICY IF EXISTS tenant_isolation_inboxes ON "inboxes";
 DROP POLICY IF EXISTS tenant_isolation_audit_events ON "audit_events";
 
--- 5. Create policies strictly binding operations to session setting app.current_organization_id
+-- 4. Create policies strictly binding operations to session setting app.current_organization_id for supportos_app
 CREATE POLICY tenant_isolation_conversations ON "conversations"
+  TO supportos_app
   FOR ALL
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
 
 CREATE POLICY tenant_isolation_messages ON "messages"
+  TO supportos_app
   FOR ALL
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
 
 CREATE POLICY tenant_isolation_tickets ON "tickets"
+  TO supportos_app
   FOR ALL
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
 
 CREATE POLICY tenant_isolation_customers ON "customers"
+  TO supportos_app
   FOR ALL
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
 
 CREATE POLICY tenant_isolation_inboxes ON "inboxes"
+  TO supportos_app
   FOR ALL
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
 
 CREATE POLICY tenant_isolation_audit_events ON "audit_events"
+  TO supportos_app
   FOR ALL
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));

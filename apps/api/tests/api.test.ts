@@ -219,5 +219,13 @@ async function runTests() {
 
 runTests().catch((err) => {
   console.error('\n❌ Test Suite Failed:', err);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    try {
+      require('fs').appendFileSync(
+        process.env.GITHUB_STEP_SUMMARY,
+        `\n### ❌ API Test Suite Failure\n\`\`\`\n${err.stack || err.message}\n\`\`\`\n`
+      );
+    } catch (_) {}
+  }
   process.exit(1);
 });

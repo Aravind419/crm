@@ -4,12 +4,12 @@
   "private": true,
   "main": "src/server.ts",
   "scripts": {
-    "dev": "ts-node src/server.ts",
+    "dev": "tsx src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "test": "ts-node tests/api.test.ts",
-    "test:security": "ts-node tests/tenant-isolation.test.ts",
-    "test:remediation": "ts-node tests/security-remediation.test.ts",
+    "test": "tsx tests/api.test.ts",
+    "test:security": "tsx tests/tenant-isolation.test.ts",
+    "test:remediation": "tsx tests/security-remediation.test.ts",
     "test:postgres-rls": "tsx tests/postgresql-rls.test.ts"
   },
   "dependencies": {
@@ -32,6 +32,7 @@
     "@types/node": "^22.13.9",
     "socket.io-client": "^4.8.4",
     "ts-node": "^10.9.2",
+    "tsx": "^4.23.15",
     "typescript": "^5.7.3"
   }
 }
