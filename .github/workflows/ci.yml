@@ -122,7 +122,7 @@ jobs:
 
       - name: Apply PostgreSQL Row-Level Security (RLS) Policies
         run: |
-          PGPASSWORD=supportos_ci_secure_password_2026 psql -h localhost -U supportos_user -d supportos_prod_test -f prisma/rls_policies.sql
+          PGPASSWORD=supportos_ci_secure_password_2026 psql -h localhost -U supportos_user -d supportos_prod_test -v ON_ERROR_STOP=1 -f prisma/rls_policies.sql
 
       - name: Run Native PostgreSQL RLS Isolation Tests
         run: npm --prefix apps/api run test:postgres-rls

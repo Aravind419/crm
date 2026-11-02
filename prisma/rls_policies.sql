@@ -38,37 +38,37 @@ DROP POLICY IF EXISTS tenant_isolation_audit_events ON "audit_events";
 
 -- 4. Create policies strictly binding operations to session setting app.current_organization_id for supportos_app
 CREATE POLICY tenant_isolation_conversations ON "conversations"
-  TO supportos_app
   FOR ALL
+  TO supportos_app
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
 
 CREATE POLICY tenant_isolation_messages ON "messages"
-  TO supportos_app
   FOR ALL
+  TO supportos_app
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
 
 CREATE POLICY tenant_isolation_tickets ON "tickets"
-  TO supportos_app
   FOR ALL
+  TO supportos_app
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
 
 CREATE POLICY tenant_isolation_customers ON "customers"
-  TO supportos_app
   FOR ALL
+  TO supportos_app
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
 
 CREATE POLICY tenant_isolation_inboxes ON "inboxes"
-  TO supportos_app
   FOR ALL
+  TO supportos_app
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
 
 CREATE POLICY tenant_isolation_audit_events ON "audit_events"
-  TO supportos_app
   FOR ALL
+  TO supportos_app
   USING ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''))
   WITH CHECK ("organizationId" = NULLIF(current_setting('app.current_organization_id', true), ''));
