@@ -39,7 +39,7 @@ jobs:
         run: |
           npx prisma generate
           npx prisma db push
-          npx ts-node prisma/seed.ts
+          npx prisma db seed
 
       - name: Run Core API Tests
         run: npm --prefix apps/api test
@@ -47,7 +47,7 @@ jobs:
       - name: Run Multi-Tenant Isolation Tests
         run: npm --prefix apps/api run test:security
 
-      - name: Run 25-Point Comprehensive Security Remediation Suite
+      - name: Run Comprehensive Security Remediation Suite
         run: npm --prefix apps/api run test:remediation
 
       - name: Compile Backend TypeScript Build

@@ -639,6 +639,9 @@ async function runSecurityRemediationSuite() {
     const initialRefresh = legacyLogin.data.refreshToken;
     assert.ok(initialRefresh, 'Login must yield a valid refresh token');
 
+    // Create an unrelated second device session for the same user
+    const secondDeviceRefresh = await (await import('../src/routes/auth.routes')).createRefreshToken(legacyUser.id);
+
     // Fire 2 concurrent refresh requests with the EXACT SAME refresh token
     const [refreshRes1, refreshRes2] = await Promise.all([
       request({
@@ -656,11 +659,28 @@ async function runSecurityRemediationSuite() {
     // Exactly one must succeed (200) and the other must be rejected (401)
     const statuses = [refreshRes1.status, refreshRes2.status].sort();
     assert.deepStrictEqual(statuses, [200, 401], 'Exactly one concurrent refresh must succeed; the other must fail (CAS)');
-    console.log('   ✅ PASS: Atomic CAS refresh token rotation prevents token reuse and race conditions');
+
+    // Winning replacement token remains completely usable!
+    const winningToken = refreshRes1.status === 200 ? refreshRes1.data.refreshToken : refreshRes2.data.refreshToken;
+    const winningRefreshAttempt = await request({
+      method: 'POST',
+      path: '/api/v1/auth/refresh',
+      body: { refreshToken: winningToken },
+    });
+    assert.strictEqual(winningRefreshAttempt.status, 200, 'Winning replacement token must remain usable');
+
+    // Unrelated device session remains completely valid!
+    const secondDeviceAttempt = await request({
+      method: 'POST',
+      path: '/api/v1/auth/refresh',
+      body: { refreshToken: secondDeviceRefresh },
+    });
+    assert.strictEqual(secondDeviceAttempt.status, 200, 'Unrelated device session must remain completely valid');
+    console.log('   ✅ PASS: Atomic CAS refresh token rotation protects concurrent winners and unrelated device sessions');
 
     // Test 23: Revoked refresh token cannot be refreshed
     console.log('23. Testing: Revoked refresh token cannot be refreshed...');
-    const activeRefresh = refreshRes1.status === 200 ? refreshRes1.data.refreshToken : refreshRes2.data.refreshToken;
+    const activeRefresh = winningRefreshAttempt.data.refreshToken;
     // Explicitly logout / revoke
     await request({
       method: 'POST',
@@ -676,8 +696,8 @@ async function runSecurityRemediationSuite() {
     assert.strictEqual(revokedRefreshAttempt.status, 401, 'Revoked refresh token must be rejected with 401');
     console.log('   ✅ PASS: Revoked refresh token rejected on refresh attempt (HTTP 401)');
 
-    // Test 24: Re-use of revoked refresh token triggers token family revocation (RFC 6819)
-    console.log('24. Testing: Stolen refresh token reuse triggers immediate token family revocation...');
+    // Test 24: Token family tracking & targeted invalidation on genuine reuse attack
+    console.log('24. Testing: Stolen refresh token reuse revokes ONLY compromised family, preserving other devices...');
     const tfUserEmail = `tf_user_${Date.now()}@example.com`;
     const tfUserPass = 'SecurePass123!';
     const tfHash = await (await import('bcryptjs')).default.hash(tfUserPass, 10);
@@ -694,44 +714,67 @@ async function runSecurityRemediationSuite() {
     });
     createdUserIds.push(tfUser.id);
 
-    const tfLogin = await request({
+    // Device Session 1 (Device A)
+    const tfLoginA = await request({
       method: 'POST',
       path: '/api/v1/auth/login',
       body: { email: tfUserEmail, password: tfUserPass },
     });
-    assert.strictEqual(tfLogin.status, 200);
-    const tokenR1 = tfLogin.data.refreshToken;
+    assert.strictEqual(tfLoginA.status, 200);
+    const tokenA1 = tfLoginA.data.refreshToken;
 
-    // Normal rotation: R1 -> R2
-    const rotate1 = await request({
+    // Device Session 2 (Device B - Unrelated session)
+    const tfLoginB = await request({
+      method: 'POST',
+      path: '/api/v1/auth/login',
+      body: { email: tfUserEmail, password: tfUserPass },
+    });
+    assert.strictEqual(tfLoginB.status, 200);
+    const tokenB1 = tfLoginB.data.refreshToken;
+
+    // Device A rotates: A1 -> A2
+    const rotateA = await request({
       method: 'POST',
       path: '/api/v1/auth/refresh',
-      body: { refreshToken: tokenR1 },
+      body: { refreshToken: tokenA1 },
     });
-    assert.strictEqual(rotate1.status, 200);
-    const tokenR2 = rotate1.data.refreshToken;
+    assert.strictEqual(rotateA.status, 200);
+    const tokenA2 = rotateA.data.refreshToken;
 
-    // Attacker attempts to reuse old token R1!
+    // Simulate elapsed time outside grace window (> 10 seconds) on token A1 to simulate genuine theft replay
+    const tokenA1Hash = crypto.createHash('sha256').update(tokenA1.trim()).digest('hex');
+    await prisma.refreshToken.update({
+      where: { tokenHash: tokenA1Hash },
+      data: { rotatedAt: new Date(Date.now() - 30000) }, // Rotated 30 seconds ago
+    });
+
+    // Attacker attempts to replay old token A1!
     const attackerReuse = await request({
       method: 'POST',
       path: '/api/v1/auth/refresh',
-      body: { refreshToken: tokenR1 },
+      body: { refreshToken: tokenA1 },
     });
     assert.strictEqual(attackerReuse.status, 401, 'Reused refresh token must be rejected');
 
-    // Legitimate client attempts to use token R2 - MUST FAIL because token family was revoked!
-    const legitR2Attempt = await request({
+    // Legitimate Device A attempts to use token A2 - MUST FAIL because Device A's family was revoked!
+    const legitA2Attempt = await request({
       method: 'POST',
       path: '/api/v1/auth/refresh',
-      body: { refreshToken: tokenR2 },
+      body: { refreshToken: tokenA2 },
     });
-    assert.strictEqual(legitR2Attempt.status, 401, 'Token R2 must be revoked as part of token family revocation');
-    console.log('   ✅ PASS: Token reuse detected & entire token family invalidated (RFC 6819 compliance)');
+    assert.strictEqual(legitA2Attempt.status, 401, 'Compromised Device A family must be revoked');
 
-    console.log('\n--- SECTION 5: BILLING WEBHOOK IDEMPOTENCY & RAW SIGNATURE DEFENSES ---');
+    // Legitimate Device B attempts to use token B1 - MUST SUCCEED because Device B is an unrelated family!
+    const legitB1Attempt = await request({
+      method: 'POST',
+      path: '/api/v1/auth/refresh',
+      body: { refreshToken: tokenB1 },
+    });
+    assert.strictEqual(legitB1Attempt.status, 200, 'Unrelated Device B session MUST remain valid and usable');
+    console.log('   ✅ PASS: Token reuse detected & ONLY compromised family revoked; unrelated device preserved');
 
-    // Test 25: Billing webhook signature verified with raw body
-    console.log('25. Testing: Billing webhook signature verified with authentic raw body...');
+    console.log('\n--- SECTION 5: STRICT BILLING WEBHOOK PROTOCOL & ATOMIC IDEMPOTENCY ---');
+
     const testEventId = `evt_billing_${Date.now()}`;
     const webhookPayload = JSON.stringify({
       id: testEventId,
@@ -741,12 +784,17 @@ async function runSecurityRemediationSuite() {
       status: 'ACTIVE',
     });
     const webhookRawBuffer = Buffer.from(webhookPayload, 'utf-8');
+    const currentTimestamp = Math.floor(Date.now() / 1000).toString();
+
+    // Canonical timestamp-bound signature: HMAC(secret, timestamp + "." + rawBody)
     const validSignature = crypto
       .createHmac('sha256', config.billingWebhookSecret)
-      .update(webhookRawBuffer)
+      .update(Buffer.concat([Buffer.from(`${currentTimestamp}.`), webhookRawBuffer]))
       .digest('hex');
 
-    const webhookRes = await request({
+    // Test 25: Missing timestamp header rejected
+    console.log('25. Testing: Billing webhook rejects missing timestamp header...');
+    const missingTimestampRes = await request({
       method: 'POST',
       path: '/api/v1/organizations/billing/webhook',
       headers: {
@@ -755,90 +803,313 @@ async function runSecurityRemediationSuite() {
       },
       rawBody: webhookRawBuffer,
     });
-    assert.strictEqual(webhookRes.status, 200, 'Valid signed webhook must return HTTP 200');
-    console.log('   ✅ PASS: Billing webhook signature verified over raw request buffer (HTTP 200)');
+    assert.strictEqual(missingTimestampRes.status, 400, 'Missing timestamp must return HTTP 400');
+    console.log('   ✅ PASS: Missing x-billing-timestamp header rejected with HTTP 400 Bad Request');
 
-    // Test 26: Billing webhook replay attack rejected (idempotency)
-    console.log('26. Testing: Billing webhook replay attack rejected via event idempotency...');
-    const replayRes = await request({
+    // Test 26: Missing event ID header rejected
+    console.log('26. Testing: Billing webhook rejects missing event ID header...');
+    const payloadWithoutId = JSON.stringify({
+      event: 'subscription.updated',
+      organizationId: convA.organizationId,
+      plan: 'BUSINESS',
+      status: 'ACTIVE',
+    });
+    const rawWithoutId = Buffer.from(payloadWithoutId, 'utf-8');
+    const sigWithoutId = crypto
+      .createHmac('sha256', config.billingWebhookSecret)
+      .update(Buffer.concat([Buffer.from(`${currentTimestamp}.`), rawWithoutId]))
+      .digest('hex');
+
+    const missingEventIdRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: {
+        'x-billing-signature': sigWithoutId,
+        'x-billing-timestamp': currentTimestamp,
+      },
+      rawBody: rawWithoutId,
+    });
+    assert.strictEqual(missingEventIdRes.status, 400, 'Missing event ID must return HTTP 400');
+    console.log('   ✅ PASS: Missing unique event ID rejected with HTTP 400 Bad Request');
+
+    // Test 27: Malformed timestamp rejected
+    console.log('27. Testing: Billing webhook rejects malformed timestamp...');
+    const malformedTimestampRes = await request({
       method: 'POST',
       path: '/api/v1/organizations/billing/webhook',
       headers: {
         'x-billing-signature': validSignature,
-        'x-billing-event-id': testEventId, // Reusing same signature & event
+        'x-billing-timestamp': 'not-a-number-abc',
+        'x-billing-event-id': testEventId,
       },
       rawBody: webhookRawBuffer,
     });
-    assert.strictEqual(replayRes.status, 200);
-    assert.strictEqual(replayRes.data.idempotent, true, 'Replayed webhook must return idempotent marker');
-    console.log('   ✅ PASS: Replay attack intercepted; duplicate webhook processed idempotently');
+    assert.strictEqual(malformedTimestampRes.status, 400, 'Malformed timestamp must return HTTP 400');
+    console.log('   ✅ PASS: Malformed timestamp rejected with HTTP 400 Bad Request');
 
-    // Test 27: Billing webhook rejects unallowed plan
-    console.log('27. Testing: Billing webhook rejects unallowed plan value...');
-    const invalidPlanPayload = JSON.stringify({
-      id: `evt_invalid_plan_${Date.now()}`,
+    // Test 28: Expired timestamp (> 300s) rejected
+    console.log('28. Testing: Billing webhook rejects expired timestamp outside tolerance...');
+    const expiredTimestamp = (Math.floor(Date.now() / 1000) - 400).toString(); // 400s old
+    const expiredSig = crypto
+      .createHmac('sha256', config.billingWebhookSecret)
+      .update(Buffer.concat([Buffer.from(`${expiredTimestamp}.`), webhookRawBuffer]))
+      .digest('hex');
+
+    const expiredTimestampRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: {
+        'x-billing-signature': expiredSig,
+        'x-billing-timestamp': expiredTimestamp,
+        'x-billing-event-id': testEventId,
+      },
+      rawBody: webhookRawBuffer,
+    });
+    assert.strictEqual(expiredTimestampRes.status, 401, 'Expired timestamp must return HTTP 401');
+    console.log('   ✅ PASS: Expired webhook timestamp rejected with HTTP 401 Unauthorized');
+
+    // Test 29: Direct-payload signature bypass attempt strictly rejected
+    console.log('29. Testing: Direct-payload signature bypass attempt strictly rejected...');
+    const directPayloadOnlySig = crypto
+      .createHmac('sha256', config.billingWebhookSecret)
+      .update(webhookRawBuffer) // Missing canonical timestamp binding!
+      .digest('hex');
+
+    const directBypassRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: {
+        'x-billing-signature': directPayloadOnlySig,
+        'x-billing-timestamp': currentTimestamp,
+        'x-billing-event-id': testEventId,
+      },
+      rawBody: webhookRawBuffer,
+    });
+    assert.strictEqual(directBypassRes.status, 401, 'Direct payload signature must be rejected');
+    console.log('   ✅ PASS: Direct payload signature without timestamp binding rejected (HTTP 401)');
+
+    // Test 30: Forged signature rejected
+    console.log('30. Testing: Billing webhook rejects forged signature...');
+    const forgedRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: {
+        'x-billing-signature': 'forged_fake_signature_aabbccddeeff',
+        'x-billing-timestamp': currentTimestamp,
+        'x-billing-event-id': testEventId,
+      },
+      rawBody: webhookRawBuffer,
+    });
+    assert.strictEqual(forgedRes.status, 401, 'Forged signature must be rejected');
+    console.log('   ✅ PASS: Forged billing webhook signature rejected (HTTP 401)');
+
+    // Test 31: Valid timestamp-bound signature succeeds
+    console.log('31. Testing: Valid timestamp-bound webhook processed successfully...');
+    const validRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: {
+        'x-billing-signature': validSignature,
+        'x-billing-timestamp': currentTimestamp,
+        'x-billing-event-id': testEventId,
+      },
+      rawBody: webhookRawBuffer,
+    });
+    assert.strictEqual(validRes.status, 200, 'Valid webhook must return HTTP 200');
+    console.log('   ✅ PASS: Valid timestamp-bound webhook processed atomically (HTTP 200)');
+
+    // Verify WebhookEvent uniqueness record stored in database
+    const storedWebhookEvent = await prisma.webhookEvent.findUnique({
+      where: { eventId: testEventId },
+    });
+    assert.ok(storedWebhookEvent, 'WebhookEvent row must exist in database with unique eventId');
+
+    // Test 32: Duplicate event rejected via database-level idempotency constraint
+    console.log('32. Testing: Duplicate event processed idempotently via database uniqueness...');
+    const duplicateRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: {
+        'x-billing-signature': validSignature,
+        'x-billing-timestamp': currentTimestamp,
+        'x-billing-event-id': testEventId, // Reusing same eventId
+      },
+      rawBody: webhookRawBuffer,
+    });
+    assert.strictEqual(duplicateRes.status, 200);
+    assert.strictEqual(duplicateRes.data.idempotent, true, 'Duplicate must return idempotent marker');
+    console.log('   ✅ PASS: Duplicate event intercepted via database constraint; processed idempotently');
+
+    // Test 33: Concurrent duplicate requests handled safely and idempotently
+    console.log('33. Testing: Concurrent duplicate webhook deliveries handled safely and idempotently...');
+    const concurrentEventId = `evt_concurrent_${Date.now()}`;
+    const concurrentPayload = JSON.stringify({
+      id: concurrentEventId,
       event: 'subscription.updated',
       organizationId: convA.organizationId,
-      plan: 'ULTRA_HACKED_TIER',
+      plan: 'BUSINESS',
+      status: 'ACTIVE',
+    });
+    const concurrentRawBuffer = Buffer.from(concurrentPayload, 'utf-8');
+    const concurrentTimestamp = Math.floor(Date.now() / 1000).toString();
+    const concurrentSig = crypto
+      .createHmac('sha256', config.billingWebhookSecret)
+      .update(Buffer.concat([Buffer.from(`${concurrentTimestamp}.`), concurrentRawBuffer]))
+      .digest('hex');
+
+    const [cRes1, cRes2] = await Promise.all([
+      request({
+        method: 'POST',
+        path: '/api/v1/organizations/billing/webhook',
+        headers: {
+          'x-billing-signature': concurrentSig,
+          'x-billing-timestamp': concurrentTimestamp,
+          'x-billing-event-id': concurrentEventId,
+        },
+        rawBody: concurrentRawBuffer,
+      }),
+      request({
+        method: 'POST',
+        path: '/api/v1/organizations/billing/webhook',
+        headers: {
+          'x-billing-signature': concurrentSig,
+          'x-billing-timestamp': concurrentTimestamp,
+          'x-billing-event-id': concurrentEventId,
+        },
+        rawBody: concurrentRawBuffer,
+      }),
+    ]);
+
+    assert.strictEqual(cRes1.status, 200);
+    assert.strictEqual(cRes2.status, 200);
+    const hasIdempotent = cRes1.data.idempotent || cRes2.data.idempotent;
+    assert.ok(hasIdempotent, 'One of the concurrent duplicate deliveries must return idempotent duplicate');
+    console.log('   ✅ PASS: Concurrent duplicate deliveries handled safely without duplicate writes');
+
+    // Test 34: Billing webhook rejects unallowed subscription plan
+    console.log('34. Testing: Billing webhook rejects unallowed subscription plan...');
+    const invalidPlanPayload = JSON.stringify({
+      id: `evt_invalid_${Date.now()}`,
+      event: 'subscription.updated',
+      organizationId: convA.organizationId,
+      plan: 'UNAUTHORIZED_CUSTOM_TIER',
     });
     const invalidPlanRaw = Buffer.from(invalidPlanPayload, 'utf-8');
-    const invalidPlanSig = crypto
+    const invalidSig = crypto
       .createHmac('sha256', config.billingWebhookSecret)
-      .update(invalidPlanRaw)
+      .update(Buffer.concat([Buffer.from(`${currentTimestamp}.`), invalidPlanRaw]))
       .digest('hex');
 
     const invalidPlanRes = await request({
       method: 'POST',
       path: '/api/v1/organizations/billing/webhook',
-      headers: { 'x-billing-signature': invalidPlanSig },
+      headers: {
+        'x-billing-signature': invalidSig,
+        'x-billing-timestamp': currentTimestamp,
+        'x-billing-event-id': `evt_invalid_${Date.now()}`,
+      },
       rawBody: invalidPlanRaw,
     });
-    assert.strictEqual(invalidPlanRes.status, 400, 'Unallowed plan must be rejected with 400 Bad Request');
-    console.log('   ✅ PASS: Billing webhook strictly rejects unallowed subscription tier values (HTTP 400)');
+    assert.strictEqual(invalidPlanRes.status, 400, 'Unallowed plan must return HTTP 400');
+    console.log('   ✅ PASS: Billing webhook strictly rejects unallowed subscription plan (HTTP 400)');
 
-    // Test 28: Billing webhook rejects forged signature
-    console.log('28. Testing: Billing webhook rejects forged signature...');
-    const forgedWebhookRes = await request({
-      method: 'POST',
-      path: '/api/v1/organizations/billing/webhook',
-      headers: { 'x-billing-signature': 'forged_fake_signature_aabbccddeeff' },
-      rawBody: webhookRawBuffer,
-    });
-    assert.strictEqual(forgedWebhookRes.status, 401, 'Forged signature must be rejected with HTTP 401 Unauthorized');
-    console.log('   ✅ PASS: Forged billing webhook signature rejected (HTTP 401)');
+    console.log('\n--- SECTION 6: DISTRIBUTED RATE LIMITING & SAFE CLIENT IP DEFENSES ---');
 
-    // Test 29: Billing webhook timestamp cryptographically bound to HMAC payload
-    console.log('29. Testing: Billing webhook timestamp cryptographically bound to HMAC payload...');
-    const timestampBoundEventId = `evt_bound_${Date.now()}`;
-    const boundPayload = JSON.stringify({
-      id: timestampBoundEventId,
-      event: 'subscription.updated',
-      organizationId: convA.organizationId,
-      plan: 'ENTERPRISE',
-      status: 'ACTIVE',
-    });
-    const boundRawBuffer = Buffer.from(boundPayload, 'utf-8');
-    const currentTimestamp = Math.floor(Date.now() / 1000).toString();
-    const boundSignature = crypto
-      .createHmac('sha256', config.billingWebhookSecret)
-      .update(Buffer.concat([Buffer.from(`${currentTimestamp}.`), boundRawBuffer]))
-      .digest('hex');
+    // Test 35: Client IP resolution ignores spoofed X-Forwarded-For when trustProxy is disabled
+    console.log('35. Testing: Client IP resolution ignores spoofed X-Forwarded-For when trustProxy=false...');
+    const { resolveClientIp } = await import('../src/middleware/rate-limiter');
+    const fakeReq = {
+      headers: { 'x-forwarded-for': '203.0.113.195, 198.51.100.1' },
+      socket: { remoteAddress: '127.0.0.1' },
+      ip: '127.0.0.1',
+    } as any;
 
-    const boundRes = await request({
-      method: 'POST',
-      path: '/api/v1/organizations/billing/webhook',
-      headers: {
-        'x-billing-signature': boundSignature,
-        'x-billing-timestamp': currentTimestamp,
-        'x-billing-event-id': timestampBoundEventId,
+    const resolvedIpUntrusted = resolveClientIp(fakeReq);
+    assert.strictEqual(resolvedIpUntrusted, '127.0.0.1', 'Spoofed X-Forwarded-For must be ignored when trustProxy=false');
+    console.log('   ✅ PASS: Spoofed X-Forwarded-For header strictly ignored under default zero-trust proxy setting');
+
+    // Test 36: Distributed rate limiter shares atomic counter state across multiple simulated API instances
+    console.log('36. Testing: Distributed rate limiter shares state across multiple simulated API instances...');
+    // Create shared in-memory mock Redis to simulate two API nodes connecting to the exact same Redis cluster
+    const sharedRedisStore = new Map<string, { value: number; expireMs: number }>();
+    const mockRedisClient = {
+      status: 'ready',
+      async eval(_script: string, _numkeys: number, key: string, windowMsStr: string) {
+        const windowMs = parseInt(windowMsStr, 10);
+        const existing = sharedRedisStore.get(key);
+        if (!existing || Date.now() > existing.expireMs) {
+          sharedRedisStore.set(key, { value: 1, expireMs: Date.now() + windowMs });
+          return 1;
+        }
+        existing.value += 1;
+        return existing.value;
       },
-      rawBody: boundRawBuffer,
+    };
+
+    const { rateLimiter } = await import('../src/middleware/rate-limiter');
+    // Instance 1 & Instance 2 share the same Redis client
+    const instance1Limiter = rateLimiter({ windowMs: 10000, max: 2, prefix: 'shared_test', redisClientOverride: mockRedisClient });
+    const instance2Limiter = rateLimiter({ windowMs: 10000, max: 2, prefix: 'shared_test', redisClientOverride: mockRedisClient });
+
+    let inst1CallCount = 0;
+    let inst2CallCount = 0;
+    let inst2Blocked = false;
+
+    const dummyReq = { headers: {}, socket: { remoteAddress: '198.51.100.99' } } as any;
+    const dummyRes1 = { setHeader: () => {}, status: () => ({ json: () => {} }) } as any;
+    const dummyRes2 = {
+      setHeader: () => {},
+      status: (code: number) => {
+        if (code === 429) inst2Blocked = true;
+        return { json: () => {} };
+      },
+    } as any;
+
+    // Instance 1 receives Request 1
+    await instance1Limiter(dummyReq, dummyRes1, () => { inst1CallCount++; });
+    // Instance 2 receives Request 2
+    await instance2Limiter(dummyReq, dummyRes1, () => { inst2CallCount++; });
+    // Instance 2 receives Request 3 -> MUST BE BLOCKED BY SHARED STATE (max: 2)
+    await instance2Limiter(dummyReq, dummyRes2, () => {});
+
+    assert.strictEqual(inst1CallCount, 1, 'Instance 1 must have allowed request 1');
+    assert.strictEqual(inst2CallCount, 1, 'Instance 2 must have allowed request 2');
+    assert.strictEqual(inst2Blocked, true, 'Instance 2 must have blocked request 3 via shared Redis state');
+    console.log('   ✅ PASS: Distributed rate limiter correctly synchronizes state across multiple API instances');
+
+    // Test 37: Distributed rate limiter fails safely with 503 when Redis is required but unavailable
+    console.log('37. Testing: Distributed rate limiter fails safely with 503 when Redis is required but down...');
+    const failedRedisClient = {
+      status: 'ready',
+      async eval() {
+        throw new Error('Connection to Redis lost');
+      },
+    };
+
+    config.requireRedis = true;
+    let serviceUnavailableReturned = false;
+    const failSafeLimiter = rateLimiter({
+      windowMs: 10000,
+      max: 5,
+      prefix: 'failsafe_test',
+      redisClientOverride: failedRedisClient,
     });
-    assert.strictEqual(boundRes.status, 200, 'Timestamp-bound signature must be accepted');
-    console.log('   ✅ PASS: Billing webhook timestamp cryptographically bound to payload in HMAC verification');
+
+    const failRes = {
+      setHeader: () => {},
+      status: (code: number) => {
+        if (code === 503) serviceUnavailableReturned = true;
+        return { json: () => {} };
+      },
+    } as any;
+
+    await failSafeLimiter(dummyReq, failRes, () => {});
+    assert.strictEqual(serviceUnavailableReturned, true, 'Must return 503 Service Unavailable when required Redis fails');
+    config.requireRedis = false; // Reset to default
+    console.log('   ✅ PASS: Distributed rate limiter fails safely with HTTP 503 when required Redis is unavailable');
 
     console.log('\n================================================================');
-    console.log('🏆 ALL 29 RIGOROUS SECURITY REMEDIATION TEST CASES PASSED!');
+    console.log('🏆 ALL 37 RIGOROUS SECURITY & RECOVERY TEST CASES PASSED!');
     console.log('================================================================');
   } finally {
     // Isolated test data cleanup
@@ -849,6 +1120,7 @@ async function runSecurityRemediationSuite() {
       await prisma.refreshToken.deleteMany({ where: { userId: { in: createdUserIds } } }).catch(() => {});
       await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } }).catch(() => {});
     }
+    await prisma.webhookEvent.deleteMany({}).catch(() => {});
 
     // Reliable server & connection teardown
     await new Promise<void>((resolve) => server.close(() => resolve()));

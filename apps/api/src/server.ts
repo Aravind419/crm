@@ -20,6 +20,10 @@ import publicRoutes from './routes/public.routes';
 const app = express();
 const server = http.createServer(app);
 
+if (config.trustProxy) {
+  app.set('trust proxy', 1);
+}
+
 // Initialize real-time Socket.IO gateway
 initSocketService(server);
 

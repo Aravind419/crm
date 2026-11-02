@@ -29,6 +29,7 @@ model Organization {
   articles        Article[]
   automationRules AutomationRule[]
   auditEvents     AuditEvent[]
+  webhookEvents   WebhookEvent[]
 
   @@map("organizations")
 }
@@ -322,16 +323,32 @@ model AuditEvent {
 }
 
 model RefreshToken {
-  id        String   @id @default(uuid())
+  id        String    @id @default(uuid())
   userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  tokenHash String   @unique
-  revoked   Boolean  @default(false)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  familyId  String    @default(uuid())
+  revoked   Boolean   @default(false)
   expiresAt DateTime
-  createdAt DateTime @default(now())
+  rotatedAt DateTime?
+  createdAt DateTime  @default(now())
 
   @@index([userId])
+  @@index([familyId])
   @@map("refresh_tokens")
+}
+
+model WebhookEvent {
+  id             String       @id @default(uuid())
+  eventId        String       @unique
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  event          String
+  status         String       @default("PROCESSED")
+  createdAt      DateTime     @default(now())
+
+  @@index([organizationId])
+  @@map("webhook_events")
 }
 
 model VisitorSession {

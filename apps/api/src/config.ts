@@ -14,6 +14,8 @@ export const config = {
   nodeEnv: process.env.NODE_ENV || 'development',
   billingWebhookSecret: process.env.BILLING_WEBHOOK_SECRET || 'supportos_dev_billing_secret_2026',
   redisUrl: process.env.REDIS_URL || null,
+  requireRedis: process.env.REQUIRE_REDIS === 'true',
+  trustProxy: process.env.TRUST_PROXY === 'true',
 };
 
 export function validateSecurityConfig(): void {

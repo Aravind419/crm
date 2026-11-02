@@ -13,13 +13,20 @@
     "build:web": "npm --prefix apps/web run build",
     "db:generate": "npx prisma generate",
     "db:push": "npx prisma db push",
-    "db:seed": "node -r ts-node/register prisma/seed.ts",
+    "db:seed": "tsx prisma/seed.ts",
     "test": "npm --prefix apps/api test",
     "test:security": "npm --prefix apps/api run test:security"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "overrides": {
+    "postcss": "^8.5.32"
   },
   "devDependencies": {
     "prisma": "^6.4.1",
     "ts-node": "^10.9.2",
+    "tsx": "^4.23.15",
     "typescript": "^5.7.3"
   },
   "dependencies": {

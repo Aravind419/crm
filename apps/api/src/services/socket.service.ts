@@ -1,5 +1,7 @@
 import { Server as HttpServer } from 'http';
 import { Server as SocketIOServer, Socket } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
+import Redis from 'ioredis';
 import * as jwt from 'jsonwebtoken';
 import * as crypto from 'crypto';
 import { config } from '../config';
@@ -40,6 +42,18 @@ export function initSocketService(server: HttpServer): SocketIOServer {
       credentials: true,
     },
   });
+
+  // Attach Redis adapter for horizontal multi-instance Socket.IO clustering if configured
+  if (config.redisUrl) {
+    try {
+      const pubClient = new Redis(config.redisUrl, { lazyConnect: false });
+      const subClient = pubClient.duplicate();
+      io.adapter(createAdapter(pubClient, subClient));
+      console.log('[Socket.IO] Attached Redis adapter for multi-instance distributed room clustering');
+    } catch (adapterErr: any) {
+      console.error('[Socket.IO Redis Adapter Error]:', adapterErr.message);
+    }
+  }
 
   // Strict Connection Authentication Middleware
   io.use(async (socket: Socket, next) => {

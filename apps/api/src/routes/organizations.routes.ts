@@ -22,66 +22,74 @@ const ALLOWED_STATUSES = ['ACTIVE', 'SUSPENDED', 'TRIAL'];
 
 /**
  * POST /api/v1/organizations/billing/webhook
- * Authenticated via HMAC-SHA256 signature calculated over the authentic raw request body.
- * Enforces replay protection, event idempotency, and strict value whitelists.
+ * Strict Webhook Protocol Verification:
+ * 1. Requires authentic raw request bytes (no JSON re-serialization fallback).
+ * 2. Requires mandatory x-billing-timestamp header within 300-second tolerance.
+ * 3. Requires mandatory unique event ID (x-billing-event-id or event ID).
+ * 4. Strict canonical HMAC-SHA256 signature verification over `${timestamp}.${rawPayload}` (no direct-payload fallback).
+ * 5. Atomic database transaction updating organization plan, audit log, and WebhookEvent idempotency record.
+ * 6. Handles concurrent duplicate deliveries safely via unique constraint and never swallows database failures.
  */
 router.post('/billing/webhook', async (req: Request, res: Response): Promise<void> => {
   try {
     const signature = req.headers['x-billing-signature'];
     const timestamp = req.headers['x-billing-timestamp'];
-    const rawPayload: Buffer = (req as any).rawBody || Buffer.from(JSON.stringify(req.body));
+    const rawPayload: Buffer | undefined = (req as any).rawBody;
+
+    // Requirement 3: Authentic raw request bytes are MANDATORY
+    if (!rawPayload || !Buffer.isBuffer(rawPayload) || rawPayload.length === 0) {
+      res.status(400).json({ error: 'Bad Request', message: 'Authentic raw request body required for webhook verification' });
+      return;
+    }
+
+    // Requirement 1 & 4: Timestamp is MANDATORY
+    if (!timestamp || typeof timestamp !== 'string') {
+      res.status(400).json({ error: 'Bad Request', message: 'Missing required x-billing-timestamp header' });
+      return;
+    }
+
+    const eventTime = parseInt(timestamp, 10);
+    const currentTime = Math.floor(Date.now() / 1000);
+    if (isNaN(eventTime)) {
+      res.status(400).json({ error: 'Bad Request', message: 'Malformed x-billing-timestamp header' });
+      return;
+    }
+
+    // Requirement 5: Reject requests older than tolerance window (300 seconds / 5 minutes)
+    if (Math.abs(currentTime - eventTime) > 300) {
+      res.status(401).json({ error: 'Unauthorized', message: 'Webhook timestamp expired or outside tolerance window' });
+      return;
+    }
 
     if (!signature || typeof signature !== 'string') {
       res.status(401).json({ error: 'Unauthorized', message: 'Missing billing signature' });
       return;
     }
 
-    // Replay attack prevention: verify timestamp if provided (tolerance: 5 minutes)
-    if (timestamp && typeof timestamp === 'string') {
-      const eventTime = parseInt(timestamp, 10);
-      const currentTime = Math.floor(Date.now() / 1000);
-      if (isNaN(eventTime) || Math.abs(currentTime - eventTime) > 300) {
-        res.status(401).json({ error: 'Unauthorized', message: 'Webhook timestamp expired or invalid' });
-        return;
-      }
-    }
-
-    // Support both direct payload signature and timestamp-bound signature (`${timestamp}.${rawPayload}`)
-    const expectedSignatureDirect = crypto
+    // Requirement 6 & 7: Verify signature STRICTLY over canonical timestamp-plus-payload format.
+    // Direct payload signature is NOT accepted as a fallback.
+    const expectedSignature = crypto
       .createHmac('sha256', config.billingWebhookSecret)
-      .update(rawPayload)
+      .update(Buffer.concat([Buffer.from(`${timestamp}.`), rawPayload]))
       .digest('hex');
 
-    const expectedSignatureBound = timestamp
-      ? crypto
-          .createHmac('sha256', config.billingWebhookSecret)
-          .update(Buffer.concat([Buffer.from(`${timestamp}.`), rawPayload]))
-          .digest('hex')
-      : null;
-
-    // Constant-time signature comparison to eliminate timing side-channels
     const sigBuffer = Buffer.from(signature);
-    const expectedDirectBuffer = Buffer.from(expectedSignatureDirect);
-    const matchesDirect =
-      sigBuffer.length === expectedDirectBuffer.length &&
-      crypto.timingSafeEqual(sigBuffer, expectedDirectBuffer);
-
-    let matchesBound = false;
-    if (expectedSignatureBound) {
-      const expectedBoundBuffer = Buffer.from(expectedSignatureBound);
-      matchesBound =
-        sigBuffer.length === expectedBoundBuffer.length &&
-        crypto.timingSafeEqual(sigBuffer, expectedBoundBuffer);
-    }
-
-    if (!matchesDirect && !matchesBound) {
+    const expectedBuffer = Buffer.from(expectedSignature);
+    if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
       res.status(401).json({ error: 'Unauthorized', message: 'Invalid billing webhook signature' });
       return;
     }
 
     const { event, organizationId, plan, status, id, eventId } = req.body;
 
-    // 1. Strict Whitelist Validations
+    // Requirement 2: Unique event ID is MANDATORY
+    const uniqueEventId = req.headers['x-billing-event-id'] || id || eventId;
+    if (!uniqueEventId || typeof uniqueEventId !== 'string' || !uniqueEventId.trim()) {
+      res.status(400).json({ error: 'Bad Request', message: 'Unique event identifier (x-billing-event-id or event ID) is required' });
+      return;
+    }
+
+    // Strict Whitelist Validations
     if (!event || !ALLOWED_WEBHOOK_EVENTS.includes(event)) {
       res.status(400).json({ error: 'Bad Request', message: `Invalid or unallowed webhook event: ${event}` });
       return;
@@ -102,17 +110,46 @@ router.post('/billing/webhook', async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    // 2. Event Idempotency & Replay Protection
-    const uniqueEventId = req.headers['x-billing-event-id'] || id || eventId;
-    if (uniqueEventId && typeof uniqueEventId === 'string') {
-      const alreadyProcessed = await prisma.auditEvent.findFirst({
-        where: {
-          action: 'BILLING_WEBHOOK_PROCESSED',
-          entityId: uniqueEventId,
-        },
+    // Requirements 8, 9, 10, 11:
+    // Atomic Transaction: WebhookEvent unique constraint + Organization Update + AuditEvent creation.
+    // Never swallow database failures!
+    try {
+      await prisma.$transaction(async (tx) => {
+        // Record unique webhook event for database-level idempotency
+        await tx.webhookEvent.create({
+          data: {
+            eventId: uniqueEventId.trim(),
+            organizationId,
+            event,
+            status: 'PROCESSED',
+          },
+        });
+
+        // Apply plan update atomically
+        await tx.organization.update({
+          where: { id: organizationId },
+          data: {
+            plan: String(plan).toUpperCase(),
+            ...(status ? { status: String(status).toUpperCase() } : {}),
+          },
+        });
+
+        // Record audit event in the same transaction
+        await tx.auditEvent.create({
+          data: {
+            organizationId,
+            action: 'BILLING_WEBHOOK_PROCESSED',
+            entityType: 'BillingEvent',
+            entityId: uniqueEventId.trim(),
+            metadata: JSON.stringify({ event, newPlan: plan, status }),
+          },
+        });
       });
 
-      if (alreadyProcessed) {
+      res.json({ success: true, message: `Organization plan successfully updated to ${plan}` });
+    } catch (txErr: any) {
+      // Prisma unique constraint violation code is P2002
+      if (txErr.code === 'P2002' || txErr.message?.includes('Unique constraint failed')) {
         res.status(200).json({
           success: true,
           idempotent: true,
@@ -120,32 +157,12 @@ router.post('/billing/webhook', async (req: Request, res: Response): Promise<voi
         });
         return;
       }
+
+      console.error('[Billing Webhook Atomic Processing Error]:', txErr);
+      res.status(500).json({ error: 'Internal Server Error', message: 'Database failure during event processing' });
     }
-
-    // 3. Apply Plan Update Atomically
-    const org = await prisma.organization.update({
-      where: { id: organizationId },
-      data: {
-        plan: String(plan).toUpperCase(),
-        ...(status ? { status: String(status).toUpperCase() } : {}),
-      },
-    });
-
-    // 4. Record Audit Event and Idempotency Marker
-    if (uniqueEventId && typeof uniqueEventId === 'string') {
-      await prisma.auditEvent.create({
-        data: {
-          organizationId: org.id,
-          action: 'BILLING_WEBHOOK_PROCESSED',
-          entityType: 'BillingEvent',
-          entityId: uniqueEventId,
-          metadata: JSON.stringify({ event, newPlan: plan, status }),
-        },
-      }).catch(() => {});
-    }
-
-    res.json({ success: true, message: `Organization plan successfully updated to ${plan}` });
   } catch (err: any) {
+    console.error('[Billing Webhook Fatal Error]:', err);
     res.status(500).json({ error: 'Internal Server Error', message: 'Webhook processing failed' });
   }
 });

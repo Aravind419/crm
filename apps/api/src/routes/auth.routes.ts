@@ -43,15 +43,17 @@ export async function verifyPassword(password: string, hash: string): Promise<bo
   return legacyHash === hash;
 }
 
-export async function createRefreshToken(userId: string): Promise<string> {
+export async function createRefreshToken(userId: string, familyId?: string): Promise<string> {
   const rawToken = crypto.randomBytes(40).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   const expiresAt = new Date(Date.now() + config.refreshTokenExpiresDays * 24 * 60 * 60 * 1000);
+  const actualFamilyId = familyId || crypto.randomUUID();
 
   await prisma.refreshToken.create({
     data: {
       userId,
       tokenHash,
+      familyId: actualFamilyId,
       expiresAt,
       revoked: false,
     },
@@ -288,51 +290,62 @@ router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
 
     // Atomic CAS rotation inside transaction to prevent concurrent refresh race conditions
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Atomically revoke ONLY if currently active and not expired
+      // 1. Atomically revoke ONLY if currently active and not expired, and record rotatedAt timestamp
+      const now = new Date();
       const updateCount = await tx.refreshToken.updateMany({
         where: {
           tokenHash,
           revoked: false,
-          expiresAt: { gt: new Date() },
+          expiresAt: { gt: now },
         },
         data: {
           revoked: true,
+          rotatedAt: now,
         },
       });
 
       if (updateCount.count === 0) {
         // Token was already revoked, expired, or non-existent
-        const compromisedToken = await tx.refreshToken.findUnique({
+        const storedToken = await tx.refreshToken.findUnique({
           where: { tokenHash },
           include: { user: true },
         });
 
-        if (compromisedToken && compromisedToken.revoked) {
-          // Token reuse / theft detected! Invalidate entire token family for this user
-          await tx.refreshToken.updateMany({
-            where: { userId: compromisedToken.userId },
-            data: { revoked: true },
-          });
+        if (storedToken && storedToken.revoked) {
+          // Distinguish near-simultaneous concurrency race from genuine later reuse attack
+          const isConcurrentRace =
+            storedToken.rotatedAt &&
+            Date.now() - storedToken.rotatedAt.getTime() < 10000; // 10s grace window for concurrent requests
 
-          await tx.auditEvent.create({
-            data: {
-              organizationId: compromisedToken.user.organizationId,
-              userId: compromisedToken.userId,
-              action: 'REFRESH_TOKEN_REUSE_DETECTED',
-              entityType: 'RefreshToken',
-              entityId: tokenHash,
-              ipAddress: req.ip || req.socket.remoteAddress || null,
-              metadata: JSON.stringify({
-                alert: 'Compromised refresh token reuse attempt detected. All active user refresh tokens revoked.',
-              }),
-            },
-          }).catch(() => {});
+          if (!isConcurrentRace) {
+            // Genuine reuse attack! Invalidate ONLY this compromised token family
+            await tx.refreshToken.updateMany({
+              where: { familyId: storedToken.familyId },
+              data: { revoked: true },
+            });
+
+            // Log security audit event without exposing raw tokens
+            await tx.auditEvent.create({
+              data: {
+                organizationId: storedToken.user.organizationId,
+                userId: storedToken.userId,
+                action: 'REFRESH_TOKEN_FAMILY_REVOKED',
+                entityType: 'RefreshTokenFamily',
+                entityId: storedToken.familyId,
+                ipAddress: req.ip || req.socket.remoteAddress || null,
+                metadata: JSON.stringify({
+                  alert: 'Compromised refresh token reuse detected. Compromised token family revoked.',
+                  familyId: storedToken.familyId,
+                }),
+              },
+            });
+          }
         }
 
         return null;
       }
 
-      // 2. Fetch the user associated with this token
+      // 2. Fetch the existing token with its familyId
       const existingToken = await tx.refreshToken.findUnique({
         where: { tokenHash },
         include: {
@@ -346,7 +359,7 @@ router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
         return null;
       }
 
-      // 3. Issue new refresh token within the same transaction
+      // 3. Issue new refresh token within the same transaction, maintaining the SAME familyId
       const newRawToken = crypto.randomBytes(40).toString('hex');
       const newTokenHash = crypto.createHash('sha256').update(newRawToken).digest('hex');
       const newExpiresAt = new Date(Date.now() + config.refreshTokenExpiresDays * 24 * 60 * 60 * 1000);
@@ -355,6 +368,7 @@ router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
         data: {
           userId: existingToken.userId,
           tokenHash: newTokenHash,
+          familyId: existingToken.familyId,
           expiresAt: newExpiresAt,
           revoked: false,
         },
@@ -405,13 +419,13 @@ router.post('/logout', async (req: Request, res: Response): Promise<void> => {
       const tokenHash = crypto.createHash('sha256').update(refreshToken.trim()).digest('hex');
       const stored = await prisma.refreshToken.findUnique({
         where: { tokenHash },
-        select: { userId: true },
-      });
-      await prisma.refreshToken.updateMany({
-        where: { tokenHash },
-        data: { revoked: true },
+        select: { userId: true, familyId: true },
       });
       if (stored) {
+        await prisma.refreshToken.updateMany({
+          where: { familyId: stored.familyId },
+          data: { revoked: true },
+        });
         disconnectUserSockets(stored.userId);
       }
     }

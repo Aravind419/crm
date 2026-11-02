@@ -12,6 +12,7 @@ async function main() {
   console.log('🌱 Starting SupportOS database seeding...');
 
   // Clean existing records in reverse dependency order
+  await prisma.webhookEvent.deleteMany({});
   await prisma.visitorSession.deleteMany({});
   await prisma.refreshToken.deleteMany({});
   await prisma.auditEvent.deleteMany({});
@@ -160,7 +161,7 @@ async function main() {
   });
 
   // Starlight Inbox (for isolation)
-  await prisma.inbox.create({
+  const starlightInbox = await prisma.inbox.create({
     data: {
       organizationId: starlightOrg.id,
       name: 'Starlight Storefront Support',
@@ -211,6 +212,18 @@ async function main() {
         company: 'QuickFlow Dev',
         plan: 'Team',
         mrr: '$199',
+      }),
+    },
+  });
+
+  const customerStarlight = await prisma.customer.create({
+    data: {
+      organizationId: starlightOrg.id,
+      name: 'Starlight Confidential Customer',
+      email: 'secret@starlight-shopper.com',
+      customAttributes: JSON.stringify({
+        company: 'Starlight Retail',
+        region: 'US-WEST',
       }),
     },
   });
@@ -324,6 +337,32 @@ async function main() {
     },
   });
 
+  // Starlight Conversation (for multi-tenant isolation verification)
+  const convStarlight = await prisma.conversation.create({
+    data: {
+      organizationId: starlightOrg.id,
+      inboxId: starlightInbox.id,
+      customerId: customerStarlight.id,
+      assigneeId: mayaStarlight.id,
+      status: 'OPEN',
+      priority: 'MEDIUM',
+      lastMessageAt: new Date(Date.now() - 300000),
+    },
+  });
+
+  await prisma.message.create({
+    data: {
+      organizationId: starlightOrg.id,
+      conversationId: convStarlight.id,
+      senderType: 'CUSTOMER',
+      senderId: customerStarlight.id,
+      senderName: customerStarlight.name,
+      messageType: 'PUBLIC_REPLY',
+      content: 'Hi Starlight, is item #89283 available in store?',
+      createdAt: new Date(Date.now() - 300000),
+    },
+  });
+
   // 9. Structured Tickets
   await prisma.ticket.create({
     data: {
@@ -351,6 +390,21 @@ async function main() {
       title: 'October GST Invoice PDF Generation',
       description: 'Customer requested manual invoice re-dispatch with GSTIN breakdown.',
       status: 'NEW',
+      priority: 'MEDIUM',
+      dueAt: new Date(Date.now() + 86400000),
+    },
+  });
+
+  await prisma.ticket.create({
+    data: {
+      ticketNumber: 5001,
+      organizationId: starlightOrg.id,
+      conversationId: convStarlight.id,
+      customerId: customerStarlight.id,
+      assigneeId: mayaStarlight.id,
+      title: 'Starlight Store Inventory Inquiry',
+      description: 'Customer checking item availability in local branch.',
+      status: 'OPEN',
       priority: 'MEDIUM',
       dueAt: new Date(Date.now() + 86400000),
     },
