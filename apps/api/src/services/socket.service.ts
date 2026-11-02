@@ -50,6 +50,14 @@ export function initSocketService(server: HttpServer): SocketIOServer {
     try {
       pubClient = new Redis(config.redisUrl, { lazyConnect: false });
       subClient = pubClient.duplicate();
+      pubClient.on('error', (err) => {
+        if (err.message && err.message.includes('Connection is closed')) return;
+        console.error('[Socket.IO Redis pubClient Error]:', err.message);
+      });
+      subClient.on('error', (err) => {
+        if (err.message && err.message.includes('Connection is closed')) return;
+        console.error('[Socket.IO Redis subClient Error]:', err.message);
+      });
       io.adapter(createAdapter(pubClient, subClient));
       console.log('[Socket.IO] Attached Redis adapter for multi-instance distributed room clustering');
     } catch (adapterErr: any) {
@@ -354,17 +362,23 @@ export function disconnectUserSockets(userId: string): void {
 }
 
 export async function closeSocketService(): Promise<void> {
+  if (io) {
+    try {
+      io.close();
+    } catch (_) {}
+    io = null;
+  }
   if (pubClient) {
-    await pubClient.quit().catch(() => pubClient?.disconnect());
+    try {
+      pubClient.disconnect();
+    } catch (_) {}
     pubClient = null;
   }
   if (subClient) {
-    await subClient.quit().catch(() => subClient?.disconnect());
+    try {
+      subClient.disconnect();
+    } catch (_) {}
     subClient = null;
-  }
-  if (io) {
-    io.close();
-    io = null;
   }
 }
 

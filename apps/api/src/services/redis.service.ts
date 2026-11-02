@@ -30,6 +30,7 @@ export function initRedis(): Redis | null {
 
     redisClient.on('error', (err) => {
       isConnected = false;
+      if (err.message && err.message.includes('Connection is closed')) return;
       console.error('[Redis Client Error]:', err.message);
     });
 
@@ -57,7 +58,9 @@ export function isRedisConnected(): boolean {
 
 export async function closeRedis(): Promise<void> {
   if (redisClient) {
-    await redisClient.quit().catch(() => redisClient?.disconnect());
+    try {
+      redisClient.disconnect();
+    } catch (_) {}
     redisClient = null;
     isConnected = false;
   }
