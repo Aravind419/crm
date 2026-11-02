@@ -17,6 +17,15 @@ async function runPostgresRlsTests() {
     return;
   }
 
+  // Application client connecting natively as unprivileged role supportos_app
+  const appDatabaseUrl = databaseUrl.replace(
+    /:\/\/[^:]+:[^@]+@/,
+    '://supportos_app:supportos_app_password_2026@'
+  );
+  const appPrisma = new PrismaClient({
+    datasources: { db: { url: appDatabaseUrl } },
+  });
+
   try {
     // 1. Verify RLS is enabled in pg_class
     console.log('1. Verifying PostgreSQL pg_class table security attributes...');
@@ -62,13 +71,9 @@ async function runPostgresRlsTests() {
     assert.ok(starlightInbox, 'Starlight inbox must exist');
     assert.ok(starlightCustomer, 'Starlight customer must exist');
 
-    // 4. Test RLS Read Isolation in a Transaction under unprivileged role supportos_app
-    console.log('\n3. Testing PostgreSQL RLS Read Isolation under non-superuser role...');
-    await prisma.$executeRawUnsafe(`GRANT supportos_app TO CURRENT_USER;`).catch(() => {});
-    await prisma.$transaction(async (tx) => {
-      // Switch to unprivileged application role subject to RLS
-      await tx.$executeRawUnsafe(`SET LOCAL ROLE supportos_app;`);
-
+    // 4. Test RLS Read Isolation using unprivileged supportos_app connection
+    console.log('\n3. Testing PostgreSQL RLS Read Isolation under supportos_app connection...');
+    await appPrisma.$transaction(async (tx) => {
       // Set session setting to Acme
       await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${acmeOrg.id}';`);
 
@@ -108,18 +113,17 @@ async function runPostgresRlsTests() {
       console.log('   ✅ PASS: Empty session setting returns 0 rows across tenant tables.');
     });
 
-    // 5. Test RLS Write Violation (INSERT check violation)
+    // 5. Test RLS Write Violation (INSERT check violation) under supportos_app connection
     console.log('\n4. Testing PostgreSQL RLS Write Isolation (CHECK violation)...');
     let rlsBlocked = false;
     try {
-      await prisma.$transaction(async (tx) => {
-        await tx.$executeRawUnsafe(`SET LOCAL ROLE supportos_app;`);
+      await appPrisma.$transaction(async (tx) => {
         await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${acmeOrg.id}';`);
 
         const dummyId = 'test-rls-violation-' + Date.now();
         await tx.$executeRawUnsafe(`
           INSERT INTO "conversations" ("id", "organizationId", "inboxId", "customerId", "status", "priority", "lastMessageAt", "createdAt", "updatedAt")
-          VALUES ('${dummyId}', '${starlightOrg.id}', '${starlightInbox.id}', '${starlightCustomer.id}', 'OPEN', 'MEDIUM', NOW(), NOW(), NOW());
+          VALUES ('${dummyId}', '${starlightOrg.id}', '${starlightInbox.id}', '${starlightCustomer.id}', 'OPEN'::"ConversationStatus", 'MEDIUM'::"Priority", NOW(), NOW(), NOW());
         `);
       });
     } catch (err: any) {
@@ -137,7 +141,8 @@ async function runPostgresRlsTests() {
 
     console.log('\n🎯 ALL PostgreSQL Row-Level Security (RLS) Tests PASSED (100% Verified)!\n');
   } finally {
-    await prisma.$disconnect();
+    await appPrisma.$disconnect().catch(() => {});
+    await prisma.$disconnect().catch(() => {});
   }
 }
 

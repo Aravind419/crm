@@ -1,31 +1,24 @@
 -- SupportOS Enterprise PostgreSQL Row-Level Security (RLS) Policy Definitions
 -- Provides defense-in-depth isolation at the database layer.
 
--- 1. Create dedicated non-superuser application role for unprivileged tenant operations
+-- 1. Create dedicated application role with login
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'supportos_app') THEN
     CREATE ROLE supportos_app WITH LOGIN PASSWORD 'supportos_app_password_2026' NOSUPERUSER NOBYPASSRLS;
+  ELSE
+    ALTER ROLE supportos_app WITH LOGIN PASSWORD 'supportos_app_password_2026' NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;
 
 -- Grant schema and table access to supportos_app
-GRANT USAGE ON SCHEMA public TO supportos_app;
+GRANT ALL ON SCHEMA public TO supportos_app;
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO supportos_app;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO supportos_app;
+GRANT ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA public TO supportos_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO supportos_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO supportos_app;
-
--- Grant role membership so connecting sessions can switch roles via SET ROLE
-GRANT supportos_app TO CURRENT_USER;
-DO $$
-BEGIN
-  IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'supportos_user') THEN
-    GRANT supportos_app TO supportos_user;
-  END IF;
-END
-$$;
 
 -- 2. Enable RLS on core tenant-owned entities
 ALTER TABLE "conversations" ENABLE ROW LEVEL SECURITY;

@@ -10,10 +10,10 @@ import { disconnectUserSockets } from '../services/socket.service';
 
 const router = Router();
 
-// Rate limiter for authentication endpoints: max 20 attempts per 60 seconds (relaxed in test harness)
+// Rate limiter for authentication endpoints: max 20 attempts per 60 seconds (relaxed in test/dev harness)
 const authRateLimiter = rateLimiter({
   windowMs: 60 * 1000,
-  max: config.nodeEnv === 'test' ? 100 : 20,
+  max: config.nodeEnv === 'production' ? 20 : 500,
   message: 'Too many authentication attempts. Please wait 1 minute before trying again.',
 });
 
