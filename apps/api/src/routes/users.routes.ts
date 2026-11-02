@@ -1,17 +1,18 @@
 import { Router, Response } from 'express';
-import * as crypto from 'crypto';
+import bcrypt from 'bcryptjs';
 import { prisma } from '../prisma';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
 import { tenantIsolationGuard } from '../middleware/tenant';
 import { requireRoles } from '../middleware/roles';
+import { EntitlementService } from '../services/entitlement.service';
 
 const router = Router();
 
 router.use(authMiddleware);
 router.use(tenantIsolationGuard);
 
-function hashPassword(password: string): string {
-  return crypto.createHash('sha256').update(password + 'supportos_salt_2026').digest('hex');
+async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, 10);
 }
 
 /**
@@ -43,7 +44,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> 
 
     res.json({ users });
   } catch (err: any) {
-    res.status(500).json({ error: 'Internal Server Error', message: err.message });
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to retrieve users' });
   }
 });
 
@@ -63,27 +64,39 @@ router.patch('/availability', async (req: AuthenticatedRequest, res: Response): 
 
     res.json({ user: updated, message: 'Availability status updated' });
   } catch (err: any) {
-    res.status(500).json({ error: 'Internal Server Error', message: err.message });
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to update availability' });
   }
 });
 
 /**
  * POST /api/v1/users/invite
  * Admins invite a new agent to the organization.
+ * ENFORCES: Entitlement limits and tenant-isolated team membership.
  */
 router.post('/invite', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { email, firstName, lastName, role, teamIds, initialPassword } = req.body;
+    const organizationId = req.organizationId!;
 
     if (!email || !firstName || !lastName) {
       res.status(400).json({ error: 'Bad Request', message: 'Email, first name, and last name are required' });
       return;
     }
 
+    // Entitlement Check: Verify agent seat limit under active subscription plan
+    const agentCheck = await EntitlementService.canAddAgent(organizationId);
+    if (!agentCheck.allowed) {
+      res.status(403).json({
+        error: 'Forbidden',
+        message: `Agent limit reached. Your ${agentCheck.plan} plan allows up to ${agentCheck.max} agents. Upgrade your subscription to add more team members.`,
+      });
+      return;
+    }
+
     const existing = await prisma.user.findFirst({
       where: {
-        organizationId: req.organizationId!,
-        email: email.toLowerCase(),
+        organizationId,
+        email: email.toLowerCase().trim(),
       },
     });
 
@@ -92,14 +105,28 @@ router.post('/invite', requireRoles(['OWNER', 'ADMIN']), async (req: Authenticat
       return;
     }
 
+    // Verify teamIds belong to current organization
+    if (teamIds && Array.isArray(teamIds) && teamIds.length > 0) {
+      const validTeams = await prisma.team.findMany({
+        where: { id: { in: teamIds }, organizationId },
+        select: { id: true },
+      });
+      if (validTeams.length !== teamIds.length) {
+        res.status(400).json({ error: 'Bad Request', message: 'One or more specified teams do not belong to your organization' });
+        return;
+      }
+    }
+
     const passwordToHash = initialPassword || 'TempPass2026!';
+    const hashedPassword = await hashPassword(passwordToHash);
+
     const user = await prisma.user.create({
       data: {
-        organizationId: req.organizationId!,
-        email: email.toLowerCase(),
-        passwordHash: hashPassword(passwordToHash),
-        firstName,
-        lastName,
+        organizationId,
+        email: email.toLowerCase().trim(),
+        passwordHash: hashedPassword,
+        firstName: firstName.trim(),
+        lastName: lastName.trim(),
         role: role || 'AGENT',
         status: 'ACTIVE',
         isAvailable: true,
@@ -124,7 +151,7 @@ router.post('/invite', requireRoles(['OWNER', 'ADMIN']), async (req: Authenticat
       },
     });
   } catch (err: any) {
-    res.status(500).json({ error: 'Internal Server Error', message: err.message });
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to invite user' });
   }
 });
 

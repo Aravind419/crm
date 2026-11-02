@@ -9,8 +9,8 @@ interface RateLimitStore {
 
 const store: RateLimitStore = {};
 
-// Clean up expired entries every 5 minutes to prevent memory leaks
-setInterval(() => {
+// Clean up expired entries every 5 minutes to prevent memory leaks (unref'd to prevent hanging processes)
+const cleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const ip in store) {
     if (store[ip].resetTime < now) {
@@ -18,6 +18,9 @@ setInterval(() => {
     }
   }
 }, 5 * 60 * 1000);
+if (cleanupInterval.unref) {
+  cleanupInterval.unref();
+}
 
 /**
  * In-memory sliding window rate limiter with automated memory cleanup.

@@ -1,6 +1,5 @@
 import express from 'express';
 import http from 'http';
-import cors from 'cors';
 import { config } from './config';
 import { initSocketService } from './services/socket.service';
 
@@ -24,27 +23,54 @@ const server = http.createServer(app);
 // Initialize real-time Socket.IO gateway
 initSocketService(server);
 
-// Dynamic CORS configuration: public routes allow embedder sites; private routes restricted
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow non-browser requests (mobile, curl, server-to-server)
-    if (!origin) return callback(null, true);
-    
-    // Check against configured CORS origins or allow widget origins
-    const allowed = config.corsOrigins.includes(origin) || origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1');
-    if (allowed) {
-      callback(null, true);
-    } else {
-      // For public widget embedders, allow public access
-      callback(null, true);
-    }
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-visitor-token'],
-}));
+// 1. Enterprise Security Response Headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-XSS-Protection', '0');
+  if (config.nodeEnv === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+// 2. Strict Differentiated CORS
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const isPublicRoute = req.path.startsWith('/api/v1/public') || req.path === '/health';
+
+  if (isPublicRoute) {
+    // Public widget endpoints allow customer websites
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-visitor-token');
+  } else if (origin) {
+    // Protected administrative routes enforce strict allow-list
+    const isAllowed =
+      config.corsOrigins.includes(origin) ||
+      origin.startsWith('http://localhost') ||
+      origin.startsWith('http://127.0.0.1');
+
+    if (isAllowed) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-visitor-token, x-billing-signature');
+    }
+  }
+
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
+
+// 3. Strict Payload Limits: 50KB for public ingress, 5MB for authenticated operations
+app.use('/api/v1/public', express.json({ limit: '50kb' }));
+app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
 // Request logging in development
 if (config.nodeEnv === 'development') {
@@ -86,12 +112,13 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Not Found', message: `Route ${req.method} ${req.url} does not exist` });
 });
 
-// Error handling middleware
+// Secure error handling middleware (Never leak internal database structures or stack traces)
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error('[Unhandled Server Error]:', err);
-  res.status(500).json({
-    error: 'Internal Server Error',
-    message: err.message || 'An unexpected error occurred',
+  const isProd = config.nodeEnv === 'production';
+  res.status(err.status || 500).json({
+    error: err.name || 'Internal Server Error',
+    message: isProd ? 'An unexpected internal error occurred' : (err.message || 'An unexpected error occurred'),
   });
 });
 

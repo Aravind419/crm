@@ -88,4 +88,42 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<voi
   }
 });
 
+/**
+ * PATCH /api/v1/customers/:id
+ * ENFORCES: Tenant boundary check preventing cross-tenant customer profile modification.
+ */
+router.patch('/:id', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const customerId = String(req.params.id);
+    const { name, email, phone, customAttributes } = req.body;
+    const organizationId = req.organizationId!;
+
+    const existing = await prisma.customer.findFirst({
+      where: {
+        id: customerId,
+        organizationId,
+      },
+    });
+
+    if (!existing) {
+      res.status(404).json({ error: 'Not Found', message: 'Customer not found' });
+      return;
+    }
+
+    const updated = await prisma.customer.update({
+      where: { id: customerId },
+      data: {
+        ...(name ? { name: String(name).trim() } : {}),
+        ...(email !== undefined ? { email: email ? String(email).toLowerCase().trim() : null } : {}),
+        ...(phone !== undefined ? { phone: phone ? String(phone).trim() : null } : {}),
+        ...(customAttributes !== undefined ? { customAttributes: typeof customAttributes === 'string' ? customAttributes : JSON.stringify(customAttributes) } : {}),
+      },
+    });
+
+    res.json({ customer: updated, message: 'Customer profile updated successfully' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to update customer' });
+  }
+});
+
 export default router;

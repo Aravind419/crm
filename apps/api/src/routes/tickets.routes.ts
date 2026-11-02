@@ -57,13 +57,14 @@ router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> 
 
     res.json({ tickets });
   } catch (err: any) {
-    res.status(500).json({ error: 'Internal Server Error', message: err.message });
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to retrieve tickets' });
   }
 });
 
 /**
  * POST /api/v1/tickets
  * Create a new ticket (escalated from conversation or standalone).
+ * ENFORCES: Cross-tenant foreign key defenses for customer, assignee, team, and conversation.
  */
 router.post('/', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
@@ -73,6 +74,48 @@ router.post('/', async (req: AuthenticatedRequest, res: Response): Promise<void>
     if (!title || !description || !customerId) {
       res.status(400).json({ error: 'Bad Request', message: 'Title, description, and customerId are required' });
       return;
+    }
+
+    // Tenant Isolation Check 1: Verify customer belongs to this organization
+    const customer = await prisma.customer.findFirst({
+      where: { id: String(customerId), organizationId },
+    });
+    if (!customer) {
+      res.status(400).json({ error: 'Bad Request', message: 'Customer does not belong to your organization' });
+      return;
+    }
+
+    // Tenant Isolation Check 2: Verify assignee belongs to this organization
+    if (assigneeId) {
+      const assignee = await prisma.user.findFirst({
+        where: { id: String(assigneeId), organizationId },
+      });
+      if (!assignee) {
+        res.status(400).json({ error: 'Bad Request', message: 'Assignee does not belong to your organization' });
+        return;
+      }
+    }
+
+    // Tenant Isolation Check 3: Verify team belongs to this organization
+    if (teamId) {
+      const team = await prisma.team.findFirst({
+        where: { id: String(teamId), organizationId },
+      });
+      if (!team) {
+        res.status(400).json({ error: 'Bad Request', message: 'Team does not belong to your organization' });
+        return;
+      }
+    }
+
+    // Tenant Isolation Check 4: Verify conversation belongs to this organization
+    if (conversationId) {
+      const conv = await prisma.conversation.findFirst({
+        where: { id: String(conversationId), organizationId },
+      });
+      if (!conv) {
+        res.status(400).json({ error: 'Bad Request', message: 'Conversation does not belong to your organization' });
+        return;
+      }
     }
 
     // Atomic auto-increment ticket number per organization
@@ -114,7 +157,7 @@ router.post('/', async (req: AuthenticatedRequest, res: Response): Promise<void>
     res.status(201).json({ ticket: result, message: `Ticket #${result.ticketNumber} created` });
   } catch (err: any) {
     console.error('[Create Ticket Error]:', err);
-    res.status(500).json({ error: 'Internal Server Error', message: err.message });
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to create ticket' });
   }
 });
 
@@ -158,12 +201,13 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<voi
 
     res.json({ ticket });
   } catch (err: any) {
-    res.status(500).json({ error: 'Internal Server Error', message: err.message });
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to retrieve ticket' });
   }
 });
 
 /**
  * PATCH /api/v1/tickets/:id
+ * ENFORCES: Tenant boundary check for ticket and all updated foreign keys.
  */
 router.patch('/:id', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
@@ -178,6 +222,27 @@ router.patch('/:id', async (req: AuthenticatedRequest, res: Response): Promise<v
     if (!existing) {
       res.status(404).json({ error: 'Not Found', message: 'Ticket not found' });
       return;
+    }
+
+    // Verify foreign keys if being updated
+    if (assigneeId !== undefined && assigneeId !== null && assigneeId !== '') {
+      const assignee = await prisma.user.findFirst({
+        where: { id: String(assigneeId), organizationId },
+      });
+      if (!assignee) {
+        res.status(400).json({ error: 'Bad Request', message: 'Assignee does not belong to your organization' });
+        return;
+      }
+    }
+
+    if (teamId !== undefined && teamId !== null && teamId !== '') {
+      const team = await prisma.team.findFirst({
+        where: { id: String(teamId), organizationId },
+      });
+      if (!team) {
+        res.status(400).json({ error: 'Bad Request', message: 'Team does not belong to your organization' });
+        return;
+      }
     }
 
     const updateData: any = {};
@@ -206,7 +271,7 @@ router.patch('/:id', async (req: AuthenticatedRequest, res: Response): Promise<v
 
     res.json({ ticket: updated, message: 'Ticket updated successfully' });
   } catch (err: any) {
-    res.status(500).json({ error: 'Internal Server Error', message: err.message });
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to update ticket' });
   }
 });
 

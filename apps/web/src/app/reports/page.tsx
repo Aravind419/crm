@@ -76,9 +76,15 @@ export default function ReportsPage() {
                   <Clock className="w-4 h-4 text-indigo-500" />
                 </div>
                 <div className="text-2xl font-bold text-slate-900">
-                  {metrics.avgFirstResponseMinutes ?? 0} <span className="text-sm font-normal text-slate-500">mins</span>
+                  {metrics.avgFirstResponseMinutes !== null && metrics.avgFirstResponseMinutes !== undefined ? (
+                    <>
+                      {metrics.avgFirstResponseMinutes} <span className="text-sm font-normal text-slate-500">mins</span>
+                    </>
+                  ) : (
+                    <span className="text-lg font-medium text-slate-400">Collecting...</span>
+                  )}
                 </div>
-                <div className="text-[11px] text-emerald-600 font-semibold mt-1">98% within SLA target</div>
+                <div className="text-[11px] text-emerald-600 font-semibold mt-1">SLA target: &lt; 15 mins</div>
               </div>
 
               <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
@@ -96,9 +102,13 @@ export default function ReportsPage() {
                   <Smile className="w-4 h-4 text-amber-500" />
                 </div>
                 <div className="text-2xl font-bold text-slate-900">
-                  {metrics.customerSatisfactionScore ?? 95}%
+                  {metrics.customerSatisfactionScore !== null && metrics.customerSatisfactionScore !== undefined ? (
+                    `${metrics.customerSatisfactionScore}%`
+                  ) : (
+                    <span className="text-lg font-medium text-slate-400">Pending ratings</span>
+                  )}
                 </div>
-                <div className="text-[11px] text-emerald-600 font-semibold mt-1">+2.4% vs previous month</div>
+                <div className="text-[11px] text-slate-500 font-medium mt-1">Post-resolution surveys</div>
               </div>
             </div>
 

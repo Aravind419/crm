@@ -4,6 +4,7 @@ import { prisma } from '../prisma';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
 import { tenantIsolationGuard } from '../middleware/tenant';
 import { requireRoles } from '../middleware/roles';
+import { EntitlementService } from '../services/entitlement.service';
 
 const router = Router();
 
@@ -46,6 +47,16 @@ router.post('/', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequ
 
     if (!name) {
       res.status(400).json({ error: 'Bad Request', message: 'Inbox name is required' });
+      return;
+    }
+
+    // Entitlement Check: Verify inbox channel limit under active subscription plan
+    const inboxCheck = await EntitlementService.canAddInbox(req.organizationId!);
+    if (!inboxCheck.allowed) {
+      res.status(403).json({
+        error: 'Forbidden',
+        message: `Inbox limit reached. Your ${inboxCheck.plan} plan allows up to ${inboxCheck.max} inboxes. Upgrade your subscription to create additional inboxes.`,
+      });
       return;
     }
 

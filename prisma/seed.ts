@@ -12,6 +12,8 @@ async function main() {
   console.log('🌱 Starting SupportOS database seeding...');
 
   // Clean existing records in reverse dependency order
+  await prisma.visitorSession.deleteMany({});
+  await prisma.refreshToken.deleteMany({});
   await prisma.auditEvent.deleteMany({});
   await prisma.automationRule.deleteMany({});
   await prisma.ticketComment.deleteMany({});

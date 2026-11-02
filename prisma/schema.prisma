@@ -69,6 +69,7 @@ model User {
   assignedTickets Ticket[]        @relation("AssignedTicketAgent")
   ticketComments  TicketComment[]
   authoredArticles Article[]
+  refreshTokens   RefreshToken[]
 
   @@unique([organizationId, email])
   @@index([organizationId])
@@ -118,7 +119,8 @@ model Inbox {
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
-  conversations Conversation[]
+  conversations   Conversation[]
+  visitorSessions VisitorSession[]
 
   @@index([organizationId])
   @@map("inboxes")
@@ -136,8 +138,9 @@ model Customer {
   createdAt        DateTime     @default(now())
   updatedAt        DateTime     @updatedAt
 
-  conversations Conversation[]
-  tickets       Ticket[]
+  conversations   Conversation[]
+  tickets         Ticket[]
+  visitorSessions VisitorSession[]
 
   @@index([organizationId, email])
   @@map("customers")
@@ -165,8 +168,9 @@ model Conversation {
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
 
-  messages Message[]
-  tickets  Ticket[]
+  messages        Message[]
+  tickets         Ticket[]
+  visitorSessions VisitorSession[]
 
   @@index([organizationId, status, createdAt])
   @@index([organizationId, assigneeId])
@@ -315,4 +319,36 @@ model AuditEvent {
 
   @@index([organizationId, createdAt])
   @@map("audit_events")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  revoked   Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model VisitorSession {
+  id             String        @id @default(uuid())
+  inboxId        String
+  inbox          Inbox         @relation(fields: [inboxId], references: [id], onDelete: Cascade)
+  customerId     String
+  customer       Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  conversationId String?
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  tokenHash      String        @unique
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([inboxId, customerId])
+  @@index([conversationId])
+  @@map("visitor_sessions")
 }

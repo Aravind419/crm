@@ -202,8 +202,10 @@ router.post('/:id/messages', async (req: AuthenticatedRequest, res: Response): P
       return msg;
     });
 
-    // Real-time broadcasts
-    broadcastToConversation(conversationId, 'message:created', message);
+    // Real-time broadcasts: Never broadcast INTERNAL_NOTE to public conversation socket
+    if (type === 'PUBLIC_REPLY') {
+      broadcastToConversation(conversationId, 'message:created', message);
+    }
     broadcastToOrg(organizationId, 'message:created', message);
 
     res.status(201).json({ message });
@@ -230,6 +232,28 @@ router.patch('/:id', async (req: AuthenticatedRequest, res: Response): Promise<v
     if (!existing) {
       res.status(404).json({ error: 'Not Found', message: 'Conversation not found' });
       return;
+    }
+
+    // Tenant Isolation Check: Verify assignee belongs to organization
+    if (assigneeId !== undefined && assigneeId !== null && assigneeId !== '') {
+      const assignee = await prisma.user.findFirst({
+        where: { id: String(assigneeId), organizationId },
+      });
+      if (!assignee) {
+        res.status(400).json({ error: 'Bad Request', message: 'Assignee does not belong to your organization' });
+        return;
+      }
+    }
+
+    // Tenant Isolation Check: Verify team belongs to organization
+    if (teamId !== undefined && teamId !== null && teamId !== '') {
+      const team = await prisma.team.findFirst({
+        where: { id: String(teamId), organizationId },
+      });
+      if (!team) {
+        res.status(400).json({ error: 'Bad Request', message: 'Team does not belong to your organization' });
+        return;
+      }
     }
 
     const updateData: any = {};

@@ -59,6 +59,25 @@ router.post('/', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequ
       return;
     }
 
+    // Cross-tenant defense: Validate all memberUserIds belong to current organization
+    if (memberUserIds && Array.isArray(memberUserIds) && memberUserIds.length > 0) {
+      const validUsers = await prisma.user.findMany({
+        where: {
+          id: { in: memberUserIds },
+          organizationId: req.organizationId!,
+        },
+        select: { id: true },
+      });
+
+      if (validUsers.length !== memberUserIds.length) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'One or more users do not belong to this organization',
+        });
+        return;
+      }
+    }
+
     const team = await prisma.team.create({
       data: {
         organizationId: req.organizationId!,

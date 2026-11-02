@@ -107,6 +107,15 @@ router.post('/articles', requireRoles(['OWNER', 'ADMIN', 'AGENT']), async (req: 
       return;
     }
 
+    // Tenant Isolation Check: Verify category belongs to organization
+    const category = await prisma.category.findFirst({
+      where: { id: String(categoryId), organizationId },
+    });
+    if (!category) {
+      res.status(400).json({ error: 'Bad Request', message: 'Category does not belong to your organization' });
+      return;
+    }
+
     const articleSlug = slug || title.toLowerCase().replace(/[^a-z0-9]/g, '-');
 
     const article = await prisma.article.create({

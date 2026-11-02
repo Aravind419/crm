@@ -10,23 +10,26 @@ router.use(tenantIsolationGuard);
 
 /**
  * GET /api/v1/reports/overview
- * Real-time aggregated operational metrics for the organization.
+ * Real-time operational metrics calculated strictly from authoritative database records.
+ * Zero fabricated or hardcoded fallback values.
  */
 router.get('/overview', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const organizationId = req.organizationId!;
 
-    // 1. Conversation Counts
+    // 1. Authoritative Conversation Counts
     const totalConversations = await prisma.conversation.count({ where: { organizationId } });
     const openConversations = await prisma.conversation.count({ where: { organizationId, status: 'OPEN' } });
     const pendingConversations = await prisma.conversation.count({ where: { organizationId, status: 'PENDING' } });
     const resolvedConversations = await prisma.conversation.count({ where: { organizationId, status: 'RESOLVED' } });
 
-    // 2. Ticket Counts
+    // 2. Authoritative Ticket Counts
     const totalTickets = await prisma.ticket.count({ where: { organizationId } });
-    const openTickets = await prisma.ticket.count({ where: { organizationId, status: { in: ['NEW', 'OPEN', 'PENDING'] } } });
+    const openTickets = await prisma.ticket.count({
+      where: { organizationId, status: { in: ['NEW', 'OPEN', 'PENDING'] } },
+    });
 
-    // 3. Average First Response Time Calculation
+    // 3. Exact First Response Time Calculation from Real Records
     const respondedConvs = await prisma.conversation.findMany({
       where: {
         organizationId,
@@ -38,18 +41,16 @@ router.get('/overview', async (req: AuthenticatedRequest, res: Response): Promis
       },
     });
 
-    let avgFirstResponseMinutes = 0;
+    let avgFirstResponseMinutes: number | null = null;
     if (respondedConvs.length > 0) {
       const totalMinutes = respondedConvs.reduce((acc, c) => {
         const diffMs = new Date(c.firstResponseAt!).getTime() - new Date(c.createdAt).getTime();
         return acc + Math.max(0, diffMs / (1000 * 60));
       }, 0);
       avgFirstResponseMinutes = Math.round(totalMinutes / respondedConvs.length);
-    } else {
-      avgFirstResponseMinutes = 12; // Realistic fallback if freshly seeded
     }
 
-    // 4. Agent Performance Leaderboard
+    // 4. Agent Performance from Real Work Assignments
     const agents = await prisma.user.findMany({
       where: { organizationId, status: 'ACTIVE' },
       select: {
@@ -67,13 +68,44 @@ router.get('/overview', async (req: AuthenticatedRequest, res: Response): Promis
       },
     });
 
-    // 5. Volume Trends (Mocked/Aggregated 7-day window)
-    const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-    const volumeTrends = days.map((day, idx) => ({
-      day,
-      incoming: Math.floor(15 + Math.sin(idx) * 8 + (idx * 2)),
-      resolved: Math.floor(12 + Math.cos(idx) * 6 + (idx * 2)),
-    }));
+    // 5. Dynamic 7-day Historical Trend Calculated from Database Timestamps
+    const now = new Date();
+    const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const volumeTrends = [];
+
+    for (let i = 6; i >= 0; i--) {
+      const targetDay = new Date(now);
+      targetDay.setDate(targetDay.getDate() - i);
+      const startOfDay = new Date(targetDay.getFullYear(), targetDay.getMonth(), targetDay.getDate(), 0, 0, 0);
+      const endOfDay = new Date(targetDay.getFullYear(), targetDay.getMonth(), targetDay.getDate(), 23, 59, 59, 999);
+
+      const incoming = await prisma.conversation.count({
+        where: {
+          organizationId,
+          createdAt: {
+            gte: startOfDay,
+            lte: endOfDay,
+          },
+        },
+      });
+
+      const resolved = await prisma.conversation.count({
+        where: {
+          organizationId,
+          resolvedAt: {
+            gte: startOfDay,
+            lte: endOfDay,
+          },
+        },
+      });
+
+      volumeTrends.push({
+        day: dayNames[targetDay.getDay()],
+        date: startOfDay.toISOString().split('T')[0],
+        incoming,
+        resolved,
+      });
+    }
 
     res.json({
       metrics: {
@@ -83,8 +115,9 @@ router.get('/overview', async (req: AuthenticatedRequest, res: Response): Promis
         resolvedConversations,
         totalTickets,
         openTickets,
-        avgFirstResponseMinutes,
-        customerSatisfactionScore: 94.6, // CSAT percentage
+        avgFirstResponseMinutes, // null if no conversations have been responded to yet
+        customerSatisfactionScore: null, // null until CSAT ratings are collected
+        hasSufficientData: totalConversations > 0,
       },
       agents: agents.map((a) => ({
         id: a.id,
@@ -97,7 +130,7 @@ router.get('/overview', async (req: AuthenticatedRequest, res: Response): Promis
       volumeTrends,
     });
   } catch (err: any) {
-    res.status(500).json({ error: 'Internal Server Error', message: err.message });
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to generate operational report' });
   }
 });
 

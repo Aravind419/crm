@@ -210,6 +210,7 @@ async function runTests() {
     console.log(`   ✅ Reporting metrics verified (Total Conversations: ${reports.data.metrics.totalConversations}).`);
 
     console.log('\n🎉 ALL CORE API & SECURITY REMEDIATION TESTS PASSED!');
+    process.exit(0);
   } finally {
     server.close();
   }
