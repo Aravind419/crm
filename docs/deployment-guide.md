@@ -95,6 +95,14 @@ volumes:
 | `NEXT_PUBLIC_API_URL` | Public HTTP API endpoint | `https://api.yourdomain.com` |
 | `NEXT_PUBLIC_SOCKET_URL`| Public WebSocket endpoint | `https://api.yourdomain.com` |
 | `NEXT_PUBLIC_APP_URL` | Public Frontend URL | `https://app.yourdomain.com` |
+| `APP_URL` | Verified public application base URL for production widget embeds and invite links | `https://app.yourdomain.com` |
+| `SMTP_HOST` | Production SMTP hostname for agent email invitations | `smtp.resend.com` or `smtp.sendgrid.net` |
+| `SMTP_PORT` | Production SMTP port | `587` or `465` |
+| `SMTP_USER` | Production SMTP username | `resend` or `apikey` |
+| `SMTP_PASS` | Production SMTP password / secret | Secret key |
+| `SMTP_SECURE` | Use TLS (true for 465, false for 587) | `false` |
+| `EMAIL_FROM` | Sender identity on outbound invitation emails | `SupportOS Invitations <invites@yourdomain.com>` |
+| `RESEND_API_KEY` | Optional direct Resend API key fallback | `re_...` |
 
 ---
 

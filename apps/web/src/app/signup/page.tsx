@@ -41,7 +41,11 @@ export default function SignupPage() {
       localStorage.setItem('supportos_user', JSON.stringify(res.user));
       localStorage.setItem('supportos_org', JSON.stringify(res.organization));
 
-      router.push('/inbox');
+      if (res.organization && !res.organization.onboardingCompleted) {
+        router.push('/onboarding');
+      } else {
+        router.push('/inbox');
+      }
     } catch (err: any) {
       setError(err.message || 'Signup failed');
     } finally {

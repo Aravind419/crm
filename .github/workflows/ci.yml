@@ -53,6 +53,9 @@ jobs:
       - name: Run Comprehensive Security Remediation Suite
         run: npm --prefix apps/api run test:remediation
 
+      - name: Run Onboarding & Administration Phase 1 Suite
+        run: npm --prefix apps/api run test:onboarding
+
       - name: Compile Backend TypeScript Build
         run: npm --prefix apps/api run build
 
@@ -132,6 +135,9 @@ jobs:
 
       - name: Run Core API Tests against PostgreSQL
         run: npm --prefix apps/api test
+
+      - name: Run Onboarding & Administration Phase 1 Suite against PostgreSQL
+        run: npm --prefix apps/api run test:onboarding
 
       - name: Compile Backend TypeScript Build against PostgreSQL Schema
         run: npm --prefix apps/api run build

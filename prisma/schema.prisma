@@ -10,13 +10,21 @@ datasource db {
 }
 
 model Organization {
-  id        String   @id @default(uuid())
-  name      String
-  slug      String   @unique
-  plan      String   @default("GROWTH") // FREE, TEAM, BUSINESS, ENTERPRISE
-  status    String   @default("ACTIVE") // ACTIVE, SUSPENDED, TRIAL
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                  String   @id @default(uuid())
+  name                String
+  slug                String   @unique
+  plan                String   @default("GROWTH") // FREE, TEAM, BUSINESS, ENTERPRISE
+  status              String   @default("ACTIVE") // ACTIVE, SUSPENDED, TRIAL
+  logoUrl             String?
+  brandColor          String   @default("#2563EB")
+  timezone            String   @default("UTC")
+  locale              String   @default("en")
+  businessHours       String?  // JSON string: { enabled: boolean, days: number[], startTime: string, endTime: string, timezone: string }
+  allowedDomains      String?  // JSON string or comma-separated allowed website domains
+  onboardingCompleted Boolean  @default(false)
+  onboardingStep      Int      @default(1)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
 
   workspaces      Workspace[]
   users           User[]
@@ -51,21 +59,25 @@ model Workspace {
 }
 
 model User {
-  id             String       @id @default(uuid())
-  organizationId String
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  email          String
-  passwordHash   String
-  firstName      String
-  lastName       String
-  role           String       @default("AGENT") // OWNER, ADMIN, AGENT
-  status         String       @default("ACTIVE") // ACTIVE, INVITED, DEACTIVATED
-  isAvailable    Boolean      @default(true)
-  avatarUrl      String?
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  id                  String       @id @default(uuid())
+  organizationId      String
+  organization        Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  email               String
+  passwordHash        String
+  firstName           String
+  lastName            String
+  role                String       @default("AGENT") // OWNER, ADMIN, AGENT
+  status              String       @default("ACTIVE") // ACTIVE, INVITED, DEACTIVATED
+  isAvailable         Boolean      @default(true)
+  avatarUrl           String?
+  invitationTokenHash String?      @unique
+  invitationExpiresAt DateTime?
+  invitedById         String?
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
 
   teamMemberships TeamMember[]
+  ledTeams        Team[]          @relation("TeamLead")
   assignedConvs   Conversation[]  @relation("AssignedAgent")
   assignedTickets Ticket[]        @relation("AssignedTicketAgent")
   ticketComments  TicketComment[]
@@ -83,6 +95,8 @@ model Team {
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   name           String
   description    String?
+  leadId         String?
+  lead           User?        @relation("TeamLead", fields: [leadId], references: [id], onDelete: SetNull)
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
@@ -117,6 +131,7 @@ model Inbox {
   inboxKey       String       @unique
   widgetColor    String       @default("#2563EB")
   greeting       String       @default("Hello! How can we assist you today?")
+  allowedOrigins String?      // Comma-separated or JSON list of approved embedder origins
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 

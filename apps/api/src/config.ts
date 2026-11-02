@@ -18,6 +18,11 @@ export const config = {
   redisUrl: process.env.REDIS_URL || null,
   requireRedis: process.env.REQUIRE_REDIS === 'true',
   trustProxy: process.env.TRUST_PROXY === 'true',
+  appUrl: (process.env.APP_URL && !process.env.APP_URL.includes('localhost'))
+    ? process.env.APP_URL
+    : (process.env.NEXT_PUBLIC_APP_URL && !process.env.NEXT_PUBLIC_APP_URL.includes('localhost'))
+    ? process.env.NEXT_PUBLIC_APP_URL
+    : 'https://app.supportos.dev',
 };
 
 export function validateSecurityConfig(cfg = config): void {

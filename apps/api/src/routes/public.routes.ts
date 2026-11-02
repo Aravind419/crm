@@ -114,12 +114,33 @@ router.get('/inbox-config/:inboxKey', async (req: Request, res: Response): Promi
       return;
     }
 
+    // Verify embedder domain if allowedOrigins are configured
+    if (inbox.allowedOrigins && inbox.allowedOrigins.trim()) {
+      const origin = req.headers.origin;
+      if (origin) {
+        const allowed = inbox.allowedOrigins.split(',').map((s) => s.trim().toLowerCase());
+        if (!allowed.includes('*')) {
+          try {
+            const hostname = new URL(origin).hostname.toLowerCase();
+            const matched = allowed.some(
+              (a) => a === origin.toLowerCase() || a === hostname || hostname.endsWith(`.${a}`)
+            );
+            if (!matched) {
+              res.status(403).json({ error: 'Forbidden', message: 'Widget embed origin not authorized for this inbox' });
+              return;
+            }
+          } catch (_) {}
+        }
+      }
+    }
+
     res.json({
       inbox: {
         id: inbox.id,
         name: inbox.name,
         widgetColor: inbox.widgetColor,
         greeting: inbox.greeting,
+        allowedOrigins: inbox.allowedOrigins,
         organizationName: inbox.organization.name,
       },
     });

@@ -175,6 +175,11 @@ router.post('/signup', authRateLimiter, async (req: Request, res: Response): Pro
         name: result.organization.name,
         slug: result.organization.slug,
         plan: result.organization.plan,
+        onboardingCompleted: result.organization.onboardingCompleted,
+        onboardingStep: result.organization.onboardingStep,
+        brandColor: result.organization.brandColor,
+        timezone: result.organization.timezone,
+        locale: result.organization.locale,
       },
     });
   } catch (err: any) {
@@ -491,6 +496,196 @@ router.get('/me', authMiddleware, async (req: AuthenticatedRequest, res: Respons
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Internal Server Error', message: 'Failed to retrieve profile' });
+  }
+});
+
+/**
+ * GET /api/v1/auth/invitations/:token
+ * Public endpoint to preview and validate an agent invitation token before acceptance.
+ */
+router.get('/invitations/:token', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const rawToken = String(req.params.token || '').trim();
+    if (!rawToken || rawToken.length < 32) {
+      res.status(400).json({ error: 'Bad Request', message: 'Valid invitation token is required' });
+      return;
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    const user = await prisma.user.findUnique({
+      where: { invitationTokenHash: tokenHash },
+      include: {
+        organization: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            logoUrl: true,
+            brandColor: true,
+          },
+        },
+      },
+    });
+
+    if (!user) {
+      res.status(404).json({ error: 'Not Found', message: 'Invalid or already used invitation token' });
+      return;
+    }
+
+    if (user.status !== 'INVITED') {
+      res.status(400).json({ error: 'Bad Request', message: 'This invitation has already been accepted' });
+      return;
+    }
+
+    if (!user.invitationExpiresAt || user.invitationExpiresAt < new Date()) {
+      res.status(410).json({ error: 'Gone', message: 'This invitation has expired. Please ask your administrator to resend it.' });
+      return;
+    }
+
+    res.json({
+      valid: true,
+      email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      role: user.role,
+      organization: user.organization,
+      organizationName: user.organization.name,
+      inviterName: 'Administrator',
+      expiresAt: user.invitationExpiresAt,
+      invitation: {
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        role: user.role,
+        organizationName: user.organization.name,
+        organization: user.organization,
+        inviterName: 'Administrator',
+        expiresAt: user.invitationExpiresAt,
+      },
+    });
+  } catch (err: any) {
+    console.error('[Auth Invitation Preview Error]:', err);
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to inspect invitation' });
+  }
+});
+
+/**
+ * POST /api/v1/auth/invitations/accept
+ * Public endpoint for an invited agent to set their password and activate their account.
+ * Single-use: invalidates invitationTokenHash immediately upon acceptance.
+ */
+router.post('/invitations/accept', authRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { token, password, firstName, lastName } = req.body;
+
+    const rawToken = String(token || '').trim();
+    if (!rawToken || rawToken.length < 32) {
+      res.status(400).json({ error: 'Bad Request', message: 'Valid invitation token is required' });
+      return;
+    }
+
+    if (!password) {
+      res.status(400).json({ error: 'Bad Request', message: 'Password is required' });
+      return;
+    }
+
+    const passwordCheck = validatePasswordPolicy(password);
+    if (!passwordCheck.valid) {
+      res.status(400).json({ error: 'Bad Request', message: passwordCheck.message });
+      return;
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    const user = await prisma.user.findUnique({
+      where: { invitationTokenHash: tokenHash },
+      include: {
+        organization: true,
+      },
+    });
+
+    if (!user) {
+      res.status(404).json({ error: 'Not Found', message: 'Invalid or already used invitation token' });
+      return;
+    }
+
+    // Replay attack defense: token cannot be reused
+    if (user.status !== 'INVITED') {
+      res.status(400).json({ error: 'Bad Request', message: 'This invitation has already been accepted' });
+      return;
+    }
+
+    // Expiration check
+    if (!user.invitationExpiresAt || user.invitationExpiresAt < new Date()) {
+      res.status(410).json({ error: 'Gone', message: 'This invitation has expired. Please request a new invitation.' });
+      return;
+    }
+
+    const hashedPassword = await hashPassword(password);
+
+    const updatedUser = await prisma.$transaction(async (tx) => {
+      const u = await tx.user.update({
+        where: { id: user.id },
+        data: {
+          passwordHash: hashedPassword,
+          status: 'ACTIVE',
+          invitationTokenHash: null, // Single-use! Invalidate token immediately
+          invitationExpiresAt: null,
+          ...(firstName && typeof firstName === 'string' && firstName.trim() ? { firstName: firstName.trim() } : {}),
+          ...(lastName && typeof lastName === 'string' && lastName.trim() ? { lastName: lastName.trim() } : {}),
+        },
+      });
+
+      await tx.auditEvent.create({
+        data: {
+          organizationId: user.organizationId,
+          userId: user.id,
+          action: 'INVITATION_ACCEPTED',
+          entityType: 'User',
+          entityId: user.id,
+          ipAddress: req.ip || req.socket.remoteAddress || null,
+          metadata: JSON.stringify({ email: user.email, role: user.role }),
+        },
+      });
+
+      return u;
+    });
+
+    const jwtToken = jwt.sign(
+      {
+        userId: updatedUser.id,
+        organizationId: updatedUser.organizationId,
+        email: updatedUser.email,
+        role: updatedUser.role,
+      },
+      config.jwtSecret,
+      { expiresIn: config.jwtExpiresIn as any }
+    );
+
+    const refreshToken = await createRefreshToken(updatedUser.id);
+
+    res.json({
+      message: 'Account successfully activated',
+      token: jwtToken,
+      refreshToken,
+      user: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        firstName: updatedUser.firstName,
+        lastName: updatedUser.lastName,
+        role: updatedUser.role,
+        status: updatedUser.status,
+      },
+      organization: {
+        id: user.organization.id,
+        name: user.organization.name,
+        slug: user.organization.slug,
+      },
+    });
+  } catch (err: any) {
+    console.error('[Auth Accept Invitation Error]:', err);
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to accept invitation' });
   }
 });
 

@@ -180,10 +180,12 @@ router.get('/current', async (req: AuthenticatedRequest, res: Response): Promise
       where: { id: req.organizationId },
       include: {
         workspaces: true,
+        inboxes: true,
         _count: {
           select: {
             users: true,
             inboxes: true,
+            teams: true,
             conversations: true,
             tickets: true,
           },
@@ -199,7 +201,25 @@ router.get('/current', async (req: AuthenticatedRequest, res: Response): Promise
     const { limits } = await EntitlementService.getPlanLimits(org.id);
 
     res.json({
-      organization: org,
+      organization: {
+        id: org.id,
+        name: org.name,
+        slug: org.slug,
+        plan: org.plan,
+        status: org.status,
+        logoUrl: org.logoUrl,
+        brandColor: org.brandColor,
+        timezone: org.timezone,
+        locale: org.locale,
+        businessHours: org.businessHours,
+        allowedDomains: org.allowedDomains,
+        onboardingCompleted: org.onboardingCompleted,
+        onboardingStep: org.onboardingStep,
+        createdAt: org.createdAt,
+        workspaces: org.workspaces,
+        inboxes: org.inboxes,
+        _count: org._count,
+      },
       subscription: {
         plan: org.plan,
         status: org.status,
@@ -214,10 +234,11 @@ router.get('/current', async (req: AuthenticatedRequest, res: Response): Promise
 /**
  * PATCH /api/v1/organizations/current
  * ANTI-TAMPERING DEFENSE: Plan modification is strictly rejected here.
+ * Allows updating: name, logoUrl, brandColor, timezone, locale, businessHours, allowedDomains.
  */
 router.patch('/current', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const { name, plan } = req.body;
+    const { name, plan, logoUrl, brandColor, timezone, locale, businessHours, allowedDomains } = req.body;
 
     // Defense: Explicitly reject client plan tampering
     if (plan !== undefined) {
@@ -228,21 +249,239 @@ router.patch('/current', requireRoles(['OWNER', 'ADMIN']), async (req: Authentic
       return;
     }
 
-    if (!name || !name.trim()) {
+    if (name !== undefined && (!name || !String(name).trim())) {
       res.status(400).json({ error: 'Bad Request', message: 'Organization name cannot be empty' });
       return;
     }
 
-    const updated = await prisma.organization.update({
-      where: { id: req.organizationId },
-      data: {
-        name: name.trim(),
-      },
+    if (brandColor !== undefined && !/^#[0-9A-Fa-f]{6}$/.test(String(brandColor).trim())) {
+      res.status(400).json({ error: 'Bad Request', message: 'Brand color must be a valid 6-character hex color (e.g. #2563EB)' });
+      return;
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const org = await tx.organization.update({
+        where: { id: req.organizationId },
+        data: {
+          ...(name !== undefined ? { name: String(name).trim() } : {}),
+          ...(logoUrl !== undefined ? { logoUrl: logoUrl ? String(logoUrl).trim() : null } : {}),
+          ...(brandColor !== undefined ? { brandColor: String(brandColor).trim() } : {}),
+          ...(timezone !== undefined ? { timezone: String(timezone).trim() } : {}),
+          ...(locale !== undefined ? { locale: String(locale).trim() } : {}),
+          ...(businessHours !== undefined
+            ? { businessHours: typeof businessHours === 'object' ? JSON.stringify(businessHours) : String(businessHours) }
+            : {}),
+          ...(allowedDomains !== undefined
+            ? { allowedDomains: typeof allowedDomains === 'object' ? JSON.stringify(allowedDomains) : String(allowedDomains) }
+            : {}),
+        },
+      });
+
+      await tx.auditEvent.create({
+        data: {
+          organizationId: req.organizationId!,
+          userId: req.user!.id,
+          action: 'ORG_SETTINGS_UPDATED',
+          entityType: 'Organization',
+          entityId: org.id,
+          ipAddress: req.ip || req.socket.remoteAddress || null,
+          metadata: JSON.stringify({ name, brandColor, timezone, locale }),
+        },
+      });
+
+      return org;
     });
 
     res.json({ organization: updated, message: 'Organization updated successfully' });
   } catch (err: any) {
     res.status(500).json({ error: 'Internal Server Error', message: 'Failed to update organization' });
+  }
+});
+
+/**
+ * POST /api/v1/organizations/onboarding
+ * Step through and complete first-time onboarding wizard.
+ */
+router.post('/onboarding', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const {
+      step,
+      companyName,
+      logoUrl,
+      brandColor,
+      timezone,
+      locale,
+      businessHours,
+      allowedDomains,
+      workspaceName,
+      inboxGreeting,
+      widgetColor,
+      completed,
+    } = req.body;
+
+    const organizationId = req.organizationId!;
+
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Update organization profile
+      const updatedOrg = await tx.organization.update({
+        where: { id: organizationId },
+        data: {
+          ...(companyName ? { name: String(companyName).trim() } : {}),
+          ...(logoUrl !== undefined ? { logoUrl: logoUrl ? String(logoUrl).trim() : null } : {}),
+          ...(brandColor ? { brandColor: String(brandColor).trim() } : {}),
+          ...(timezone ? { timezone: String(timezone).trim() } : {}),
+          ...(locale ? { locale: String(locale).trim() } : {}),
+          ...(businessHours ? { businessHours: typeof businessHours === 'object' ? JSON.stringify(businessHours) : String(businessHours) } : {}),
+          ...(allowedDomains ? { allowedDomains: typeof allowedDomains === 'object' ? JSON.stringify(allowedDomains) : String(allowedDomains) } : {}),
+          ...(step ? { onboardingStep: parseInt(step, 10) } : {}),
+          ...(completed === true ? { onboardingCompleted: true } : {}),
+        },
+      });
+
+      // 2. Update default workspace name if provided
+      if (workspaceName) {
+        const primaryWorkspace = await tx.workspace.findFirst({
+          where: { organizationId },
+          orderBy: { createdAt: 'asc' },
+        });
+        if (primaryWorkspace) {
+          await tx.workspace.update({
+            where: { id: primaryWorkspace.id },
+            data: { name: String(workspaceName).trim() },
+          });
+        }
+      }
+
+      // 3. Update primary live chat inbox configuration if provided
+      if (inboxGreeting || widgetColor) {
+        const primaryInbox = await tx.inbox.findFirst({
+          where: { organizationId },
+          orderBy: { createdAt: 'asc' },
+        });
+        if (primaryInbox) {
+          await tx.inbox.update({
+            where: { id: primaryInbox.id },
+            data: {
+              ...(inboxGreeting ? { greeting: String(inboxGreeting).trim() } : {}),
+              ...(widgetColor ? { widgetColor: String(widgetColor).trim() } : {}),
+            },
+          });
+        }
+      }
+
+      await tx.auditEvent.create({
+        data: {
+          organizationId,
+          userId: req.user!.id,
+          action: completed ? 'ONBOARDING_COMPLETED' : 'ONBOARDING_STEP_SAVED',
+          entityType: 'Organization',
+          entityId: organizationId,
+          ipAddress: req.ip || req.socket.remoteAddress || null,
+          metadata: JSON.stringify({ step, completed }),
+        },
+      });
+
+      return updatedOrg;
+    });
+
+    res.json({
+      message: completed ? 'Onboarding successfully completed' : 'Onboarding step saved',
+      organization: result,
+    });
+  } catch (err: any) {
+    console.error('[Onboarding Error]:', err);
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to process onboarding' });
+  }
+});
+
+/**
+ * GET /api/v1/organizations/widget-snippet
+ * Generate production-ready widget installation snippet using verified public application URL.
+ * NEVER outputs localhost in production.
+ */
+router.get('/widget-snippet', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const inboxes = await prisma.inbox.findMany({
+      where: { organizationId: req.organizationId },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const publicUrl = config.appUrl;
+
+    const snippets = inboxes.map((inbox) => ({
+      inboxId: inbox.id,
+      inboxName: inbox.name,
+      inboxKey: inbox.inboxKey,
+      widgetColor: inbox.widgetColor,
+      greeting: inbox.greeting,
+      allowedOrigins: inbox.allowedOrigins,
+      snippet: `<script src="${publicUrl}/widget.js" data-inbox-key="${inbox.inboxKey}" async></script>`,
+    }));
+
+    res.json({
+      publicAppUrl: publicUrl,
+      snippets,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to generate widget snippets' });
+  }
+});
+
+/**
+ * PATCH /api/v1/organizations/inboxes/:id
+ * Update inbox channel settings (greeting, widget color, allowed website domains).
+ */
+router.patch('/inboxes/:id', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const id = String(req.params.id);
+    const { name, greeting, widgetColor, allowedOrigins } = req.body;
+    const organizationId = req.organizationId!;
+
+    const targetInbox = await prisma.inbox.findFirst({
+      where: { id, organizationId },
+    });
+
+    if (!targetInbox) {
+      res.status(404).json({ error: 'Not Found', message: 'Inbox not found in your organization' });
+      return;
+    }
+
+    if (widgetColor && !/^#[0-9A-Fa-f]{6}$/.test(String(widgetColor).trim())) {
+      res.status(400).json({ error: 'Bad Request', message: 'Widget color must be a valid 6-character hex color (e.g. #2563EB)' });
+      return;
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const ibx = await tx.inbox.update({
+        where: { id: targetInbox.id },
+        data: {
+          ...(name ? { name: String(name).trim() } : {}),
+          ...(greeting ? { greeting: String(greeting).trim() } : {}),
+          ...(widgetColor ? { widgetColor: String(widgetColor).trim() } : {}),
+          ...(allowedOrigins !== undefined
+            ? { allowedOrigins: typeof allowedOrigins === 'object' ? JSON.stringify(allowedOrigins) : String(allowedOrigins).trim() }
+            : {}),
+        },
+      });
+
+      await tx.auditEvent.create({
+        data: {
+          organizationId,
+          userId: req.user!.id,
+          action: 'INBOX_UPDATED',
+          entityType: 'Inbox',
+          entityId: ibx.id,
+          ipAddress: req.ip || req.socket.remoteAddress || null,
+          metadata: JSON.stringify({ name, greeting, widgetColor, allowedOrigins }),
+        },
+      });
+
+      return ibx;
+    });
+
+    res.json({ inbox: updated, message: 'Inbox updated successfully' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to update inbox' });
   }
 });
 
