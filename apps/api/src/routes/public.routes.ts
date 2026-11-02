@@ -4,6 +4,8 @@ import { prisma } from '../prisma';
 import { rateLimiter } from '../middleware/rate-limiter';
 import { broadcastToOrg, broadcastToConversation, disconnectVisitorSockets } from '../services/socket.service';
 import { evaluateAutomationRules } from '../services/automation.engine';
+import { runInTenantContext } from '../tenancy/tenant-context';
+import { AuthLookupService } from '../tenancy/auth-lookup.service';
 
 const router = Router();
 
@@ -36,7 +38,7 @@ export function extractVisitorToken(req: Request): string | null {
 export async function verifyVisitorSession(
   rawToken: string | null,
   conversationId: string
-): Promise<{ valid: boolean; statusCode: number; error?: string }> {
+): Promise<{ valid: boolean; statusCode: number; error?: string; organizationId?: string; customerId?: string }> {
   if (!rawToken || !rawToken.trim()) {
     return {
       valid: false,
@@ -55,16 +57,8 @@ export async function verifyVisitorSession(
 
   const tokenHash = crypto.createHash('sha256').update(rawToken.trim()).digest('hex');
 
-  // Query database strictly for authoritative VisitorSession record by tokenHash
-  const session = await prisma.visitorSession.findFirst({
-    where: { tokenHash },
-    select: {
-      id: true,
-      conversationId: true,
-      expiresAt: true,
-      revokedAt: true,
-    },
-  });
+  // Look up verified visitor session via pre-auth helper
+  const session = await AuthLookupService.lookupVisitorSession(tokenHash);
 
   if (!session) {
     return {
@@ -87,7 +81,7 @@ export async function verifyVisitorSession(
     return { valid: false, statusCode: 403, error: 'Visitor session does not match requested conversation' };
   }
 
-  return { valid: true, statusCode: 200 };
+  return { valid: true, statusCode: 200, organizationId: session.organizationId, customerId: session.customerId };
 }
 
 /**
@@ -96,18 +90,7 @@ export async function verifyVisitorSession(
 router.get('/inbox-config/:inboxKey', async (req: Request, res: Response): Promise<void> => {
   try {
     const inboxKey = String(req.params.inboxKey);
-    const inbox = await prisma.inbox.findUnique({
-      where: { inboxKey },
-      include: {
-        organization: {
-          select: {
-            id: true,
-            name: true,
-            slug: true,
-          },
-        },
-      },
-    });
+    const inbox = await AuthLookupService.lookupInboxByKey(inboxKey);
 
     if (!inbox) {
       res.status(404).json({ error: 'Not Found', message: 'Invalid or deactivated inbox key' });
@@ -141,7 +124,7 @@ router.get('/inbox-config/:inboxKey', async (req: Request, res: Response): Promi
         widgetColor: inbox.widgetColor,
         greeting: inbox.greeting,
         allowedOrigins: inbox.allowedOrigins,
-        organizationName: inbox.organization.name,
+        organizationName: inbox.orgName,
       },
     });
   } catch (err: any) {
@@ -163,10 +146,7 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    const inbox = await prisma.inbox.findUnique({
-      where: { inboxKey: String(inboxKey) },
-      include: { organization: true },
-    });
+    const inbox = await AuthLookupService.lookupInboxByKey(String(inboxKey));
 
     if (!inbox) {
       res.status(404).json({ error: 'Not Found', message: 'Inbox not found' });
@@ -182,8 +162,8 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
     const tokenHash = crypto.createHash('sha256').update(safeVisitorToken).digest('hex');
     const sessionExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
 
-    // Atomic transaction
-    const { conversation, createdMessage } = await prisma.$transaction(async (tx) => {
+    // Atomic transaction under transaction-local PostgreSQL RLS context
+    const { conversation, createdMessage } = await runInTenantContext(organizationId, async (tx) => {
       let customer = customerEmail
         ? await tx.customer.findFirst({
             where: { organizationId, email: customerEmail },
@@ -209,7 +189,7 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
             typeof rawAttrs === 'string'
               ? JSON.parse(rawAttrs)
               : (rawAttrs as any) || {};
-          delete existingAttrs.visitorToken; // Scrub any legacy token
+          delete existingAttrs.visitorToken;
           await tx.customer.update({
             where: { id: customer.id },
             data: { customAttributes: typeof rawAttrs === 'string' ? JSON.stringify(existingAttrs) : existingAttrs },
@@ -250,22 +230,26 @@ router.post('/conversations', async (req: Request, res: Response): Promise<void>
           conversationId: conv.id,
           senderType: 'CUSTOMER',
           senderId: customer.id,
-          senderName: customer.name,
+          senderName: customerName,
           messageType: 'PUBLIC_REPLY',
           content: String(message).trim(),
         },
       });
 
       return { conversation: conv, createdMessage: msg };
-    });
+    }, { actorType: 'VISITOR' });
 
+    // Real-time broadcasts
+    broadcastToConversation(conversation.id, 'conversation:created', conversation);
     broadcastToOrg(organizationId, 'conversation:created', conversation);
-    broadcastToOrg(organizationId, 'message:created', createdMessage);
 
+    // Automation evaluation
     evaluateAutomationRules(organizationId, 'conversation.created', {
       conversationId: conversation.id,
-      messageContent: String(message).trim(),
+      messageContent: String(message),
       customerEmail: customerEmail || undefined,
+    }).catch((err) => {
+      console.error('[Automation Error]:', err);
     });
 
     res.status(201).json({
@@ -292,7 +276,7 @@ router.get('/conversations/:conversationId', async (req: Request, res: Response)
 
     // Verify visitor authorization
     const authCheck = await verifyVisitorSession(visitorToken, conversationId);
-    if (!authCheck.valid) {
+    if (!authCheck.valid || !authCheck.organizationId) {
       res.status(authCheck.statusCode).json({
         error: 'Forbidden',
         message: authCheck.error,
@@ -300,30 +284,32 @@ router.get('/conversations/:conversationId', async (req: Request, res: Response)
       return;
     }
 
-    const conversation = await prisma.conversation.findUnique({
-      where: { id: conversationId },
-      include: {
-        customer: true,
-        inbox: {
-          select: {
-            name: true,
-            widgetColor: true,
-            greeting: true,
+    const conversation = await runInTenantContext(authCheck.organizationId, async (tx) => {
+      return tx.conversation.findUnique({
+        where: { id: conversationId },
+        include: {
+          customer: true,
+          inbox: {
+            select: {
+              name: true,
+              widgetColor: true,
+              greeting: true,
+            },
+          },
+          messages: {
+            where: { messageType: 'PUBLIC_REPLY' }, // CRITICAL PRIVACY DEFENSE: Never leak INTERNAL_NOTE
+            orderBy: { createdAt: 'asc' },
+            select: {
+              id: true,
+              senderType: true,
+              senderName: true,
+              content: true,
+              createdAt: true,
+            },
           },
         },
-        messages: {
-          where: { messageType: 'PUBLIC_REPLY' }, // CRITICAL PRIVACY DEFENSE: Never leak INTERNAL_NOTE
-          orderBy: { createdAt: 'asc' },
-          select: {
-            id: true,
-            senderType: true,
-            senderName: true,
-            content: true,
-            createdAt: true,
-          },
-        },
-      },
-    });
+      });
+    }, { actorId: authCheck.customerId, actorType: 'VISITOR' });
 
     if (!conversation) {
       res.status(404).json({ error: 'Not Found', message: 'Conversation not found' });
@@ -361,7 +347,7 @@ router.post('/conversations/:conversationId/messages', async (req: Request, res:
 
     // Verify visitor authorization
     const authCheck = await verifyVisitorSession(visitorToken, conversationId);
-    if (!authCheck.valid) {
+    if (!authCheck.valid || !authCheck.organizationId) {
       res.status(authCheck.statusCode).json({
         error: 'Forbidden',
         message: authCheck.error,
@@ -369,17 +355,16 @@ router.post('/conversations/:conversationId/messages', async (req: Request, res:
       return;
     }
 
-    const conv = await prisma.conversation.findUnique({
-      where: { id: conversationId },
-      include: { customer: true },
-    });
+    const created = await runInTenantContext(authCheck.organizationId, async (tx) => {
+      const conv = await tx.conversation.findUnique({
+        where: { id: conversationId },
+        include: { customer: true },
+      });
 
-    if (!conv) {
-      res.status(404).json({ error: 'Not Found', message: 'Conversation not found' });
-      return;
-    }
+      if (!conv) {
+        return null;
+      }
 
-    const created = await prisma.$transaction(async (tx) => {
       const msg = await tx.message.create({
         data: {
           organizationId: conv.organizationId,
@@ -400,14 +385,19 @@ router.post('/conversations/:conversationId/messages', async (req: Request, res:
         },
       });
 
-      return msg;
-    });
+      return { msg, conv };
+    }, { actorId: authCheck.customerId, actorType: 'VISITOR' });
+
+    if (!created) {
+      res.status(404).json({ error: 'Not Found', message: 'Conversation not found' });
+      return;
+    }
 
     // Broadcast only public reply
-    broadcastToConversation(conversationId, 'message:created', created);
-    broadcastToOrg(conv.organizationId, 'message:created', created);
+    broadcastToConversation(conversationId, 'message:created', created.msg);
+    broadcastToOrg(created.conv.organizationId, 'message:created', created.msg);
 
-    res.status(201).json({ message: created });
+    res.status(201).json({ message: created.msg });
   } catch (err: any) {
     res.status(500).json({ error: 'Internal Server Error', message: 'Failed to post message' });
   }
@@ -420,19 +410,28 @@ router.post('/conversations/:conversationId/messages', async (req: Request, res:
 router.post('/sessions/revoke', async (req: Request, res: Response): Promise<void> => {
   try {
     const visitorToken = extractVisitorToken(req);
+    const { conversationId } = req.body;
+
     if (!visitorToken) {
       res.status(400).json({ error: 'Bad Request', message: 'visitorToken is required' });
       return;
     }
 
     const tokenHash = crypto.createHash('sha256').update(visitorToken.trim()).digest('hex');
-    await prisma.visitorSession.updateMany({
-      where: { tokenHash },
-      data: { revokedAt: new Date() },
-    });
 
-    // Real-time disconnection: Immediately sever any active WebSocket connections bound to this revoked session
-    disconnectVisitorSockets(tokenHash);
+    const session = await AuthLookupService.lookupVisitorSession(tokenHash);
+
+    if (session) {
+      await runInTenantContext(session.organizationId, async (tx) => {
+        await tx.visitorSession.updateMany({
+          where: { tokenHash },
+          data: { revokedAt: new Date() },
+        });
+      }, { actorType: 'VISITOR' });
+
+      // Disconnect any active WebSocket connections bound to this session
+      disconnectVisitorSockets(tokenHash);
+    }
 
     res.json({ message: 'Visitor session revoked successfully' });
   } catch (err: any) {
@@ -447,49 +446,51 @@ router.get('/portal/:orgSlug', async (req: Request, res: Response): Promise<void
   try {
     const orgSlug = String(req.params.orgSlug);
     const { search } = req.query;
-    const org = await prisma.organization.findUnique({
-      where: { slug: orgSlug },
-      select: { id: true, name: true, slug: true },
-    });
+
+    const org = await AuthLookupService.lookupOrgBySlug(orgSlug);
 
     if (!org) {
       res.status(404).json({ error: 'Not Found', message: 'Help center not found' });
       return;
     }
 
-    const whereClause: any = {
-      organizationId: org.id,
-      status: 'PUBLISHED',
-    };
+    const result = await runInTenantContext(org.id, async (tx) => {
+      const whereClause: any = {
+        organizationId: org.id,
+        status: 'PUBLISHED',
+      };
 
-    if (search && String(search).trim()) {
-      const q = String(search).trim();
-      whereClause.OR = [
-        { title: { contains: q } },
-        { content: { contains: q } },
-      ];
-    }
+      if (search && String(search).trim()) {
+        const q = String(search).trim();
+        whereClause.OR = [
+          { title: { contains: q } },
+          { content: { contains: q } },
+        ];
+      }
 
-    const categories = await prisma.category.findMany({
-      where: { organizationId: org.id },
-      include: {
-        articles: {
-          where: whereClause,
-          select: {
-            id: true,
-            title: true,
-            slug: true,
-            viewCount: true,
-            updatedAt: true,
+      const categories = await tx.category.findMany({
+        where: { organizationId: org.id },
+        include: {
+          articles: {
+            where: whereClause,
+            select: {
+              id: true,
+              title: true,
+              slug: true,
+              viewCount: true,
+              updatedAt: true,
+            },
           },
         },
-      },
-      orderBy: { orderIndex: 'asc' },
-    });
+        orderBy: { orderIndex: 'asc' },
+      });
+
+      return categories;
+    }, { actorType: 'VISITOR' });
 
     res.json({
       organization: org,
-      categories: categories.filter((c) => c.articles.length > 0 || !search),
+      categories: result.filter((c) => c.articles.length > 0 || !search),
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Internal Server Error', message: 'Failed to retrieve help center portal' });
@@ -504,39 +505,42 @@ router.get('/portal/:orgSlug/articles/:articleSlug', async (req: Request, res: R
     const orgSlug = String(req.params.orgSlug);
     const articleSlug = String(req.params.articleSlug);
 
-    const org = await prisma.organization.findUnique({
-      where: { slug: orgSlug },
-      select: { id: true, name: true, slug: true },
-    });
+    const org = await AuthLookupService.lookupOrgBySlug(orgSlug);
 
     if (!org) {
       res.status(404).json({ error: 'Not Found', message: 'Help center not found' });
       return;
     }
 
-    const article = await prisma.article.findFirst({
-      where: {
-        organizationId: org.id,
-        slug: articleSlug,
-        status: 'PUBLISHED',
-      },
-      include: {
-        category: true,
-        author: {
-          select: { firstName: true, lastName: true },
+    const article = await runInTenantContext(org.id, async (tx) => {
+      const art = await tx.article.findFirst({
+        where: {
+          organizationId: org.id,
+          slug: articleSlug,
+          status: 'PUBLISHED',
         },
-      },
-    });
+        include: {
+          category: true,
+          author: {
+            select: { firstName: true, lastName: true },
+          },
+        },
+      });
+
+      if (!art) return null;
+
+      await tx.article.update({
+        where: { id: art.id },
+        data: { viewCount: { increment: 1 } },
+      });
+
+      return art;
+    }, { actorType: 'VISITOR' });
 
     if (!article) {
       res.status(404).json({ error: 'Not Found', message: 'Article not found' });
       return;
     }
-
-    await prisma.article.update({
-      where: { id: article.id },
-      data: { viewCount: { increment: 1 } },
-    });
 
     res.json({ article, organization: org });
   } catch (err: any) {

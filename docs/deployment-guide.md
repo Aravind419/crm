@@ -2,7 +2,7 @@
 
 ## 1. System Requirements & Architecture
 
-SupportOS is designed to run in modern containerized cloud environments (AWS ECS, Google Cloud Run, Kubernetes, or Docker Compose on a single Linux VPS).
+SupportOS is designed to run in modern containerized cloud environments (AWS ECS, Google Cloud Run, Kubernetes, or Docker Compose on a single Linux VPS) paired with managed PostgreSQL (e.g., Neon Serverless PostgreSQL or AWS RDS Aurora).
 
 ### Minimum Server Specification:
 - **CPU**: 2 vCPUs
@@ -25,7 +25,7 @@ services:
     restart: always
     environment:
       POSTGRES_USER: supportos_admin
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
       POSTGRES_DB: supportos
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -49,9 +49,15 @@ services:
     environment:
       NODE_ENV: production
       PORT: 4000
-      DATABASE_URL: postgresql://supportos_admin:${POSTGRES_PASSWORD}@postgres:5432/supportos?schema=public
+      # Dedicated runtime unprivileged role
+      DATABASE_URL: postgresql://supportos_app:${APP_ROLE_PASSWORD}@postgres:5432/supportos?schema=public
+      DIRECT_URL: postgresql://supportos_admin:${POSTGRES_ADMIN_PASSWORD}@postgres:5432/supportos?schema=public
       JWT_SECRET: ${JWT_SECRET}
+      BILLING_WEBHOOK_SECRET: ${BILLING_WEBHOOK_SECRET}
       CORS_ORIGIN: https://app.yourdomain.com
+      REDIS_URL: redis://redis:6379
+      REQUIRE_REDIS: "true"
+      APP_URL: https://app.yourdomain.com
     depends_on:
       - postgres
       - redis
@@ -84,44 +90,61 @@ volumes:
 | Variable | Description | Production Example |
 | :--- | :--- | :--- |
 | `PORT` | API listen port | `4000` |
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://user:pass@host:5432/supportos?sslmode=require` |
+| `DATABASE_URL` | Restricted runtime role (`supportos_app`) with connection pooling | `postgresql://supportos_app:SECRET@ep-round-recipe-pooler.c-8.us-east-2.aws.neon.tech/neondb?sslmode=require` |
+| `DIRECT_URL` | Administrative DDL owner role (`neondb_owner`) for migrations | `postgresql://neondb_owner:SECRET@ep-round-recipe.c-8.us-east-2.aws.neon.tech/neondb?sslmode=require` |
+| `APP_ROLE_PASSWORD` | Password for `supportos_app` provisioning / credential rotation | Cryptographically strong password |
 | `JWT_SECRET` | 256-bit cryptographically secure string (>= 32 chars) | Generated via `openssl rand -hex 32` |
-| `BILLING_WEBHOOK_SECRET` | Secret key for billing webhook HMAC-SHA256 verification | Generated via `openssl rand -hex 32` |
-| `CORS_ORIGIN` | Allowed administrative web origins (comma-separated) | `https://app.yourdomain.com` |
+| `BILLING_WEBHOOK_SECRET` | Secret key for billing webhook HMAC-SHA256 verification (>= 32 chars) | Generated via `openssl rand -hex 32` |
+| `CORS_ORIGIN` | Allowed administrative web origins (comma-separated, no wildcards) | `https://app.yourdomain.com` |
 | `ALLOWED_WIDGET_ORIGINS` | Allowed customer embedding origins for public widget | `*` or `https://customer1.com,https://customer2.com` |
-| `REDIS_URL` | Redis instance for rate limiting & WebSocket cluster | `redis://redis:6379` |
+| `REDIS_URL` | Redis connection string for distributed rate limiting & WebSockets | `redis://redis:6379` |
 | `REQUIRE_REDIS` | Fail closed (503) if Redis is unavailable | `true` |
-| `TRUST_PROXY` | Trust reverse proxy headers (X-Forwarded-For) | `true` |
+| `TRUST_PROXY` | Trust reverse proxy headers (`X-Forwarded-For`) | `true` |
 | `NEXT_PUBLIC_API_URL` | Public HTTP API endpoint | `https://api.yourdomain.com` |
 | `NEXT_PUBLIC_SOCKET_URL`| Public WebSocket endpoint | `https://api.yourdomain.com` |
 | `NEXT_PUBLIC_APP_URL` | Public Frontend URL | `https://app.yourdomain.com` |
-| `APP_URL` | Verified public application base URL for production widget embeds and invite links | `https://app.yourdomain.com` |
+| `APP_URL` | Verified public application base URL for widget embeds and invites | `https://app.yourdomain.com` |
 | `SMTP_HOST` | Production SMTP hostname for agent email invitations | `smtp.resend.com` or `smtp.sendgrid.net` |
 | `SMTP_PORT` | Production SMTP port | `587` or `465` |
 | `SMTP_USER` | Production SMTP username | `resend` or `apikey` |
 | `SMTP_PASS` | Production SMTP password / secret | Secret key |
-| `SMTP_SECURE` | Use TLS (true for 465, false for 587) | `false` |
-| `EMAIL_FROM` | Sender identity on outbound invitation emails | `SupportOS Invitations <invites@yourdomain.com>` |
+| `SMTP_SECURE` | Use TLS (`true` for 465, `false` for 587) | `false` |
+| `EMAIL_FROM` | Sender identity on outbound invitation emails | `SupportOS <invites@yourdomain.com>` |
 | `RESEND_API_KEY` | Optional direct Resend API key fallback | `re_...` |
 
 ---
 
-## 4. Database Roles & Migration Setup
+## 4. Zero-Trust PostgreSQL Roles & Row-Level Security
 
-For enterprise zero-trust database security, database administration/migrations and application runtime should execute under separate database credentials:
+To prevent catastrophic cross-tenant data exfiltration and enforce zero-trust database defense-in-depth, SupportOS strictly decouples schema administration from application runtime:
 
-- **Migration / DDL Role (`DIRECT_URL`)**: Owns the database schema and executes migrations via direct compute sessions with advisory locks (`_prisma_migrations`).
-- **Application Runtime Role (`DATABASE_URL`)**: Uses restricted unprivileged role `supportos_app` (`NOSUPERUSER NOBYPASSRLS`) connecting through pgBouncer transaction pooling. Possesses strictly `SELECT, INSERT, UPDATE, DELETE` on application tables and zero access to `_prisma_migrations`.
+1. **Migration / DDL Role (`DIRECT_URL`)**:
+   - Role: `neondb_owner` / `supportos_admin`.
+   - Capabilities: `SUPERUSER` or table owner.
+   - Purpose: Applies Prisma schema migrations, DDL adjustments, and role provisioning. Never used by live HTTP or background request handlers.
+
+2. **Application Runtime Role (`DATABASE_URL`)**:
+   - Role: `supportos_app`.
+   - Capabilities: `NOSUPERUSER`, `NOBYPASSRLS`, zero table ownership.
+   - Purpose: Executes all API requests, background workers, and Socket.IO queries.
+   - Access Permissions: Minimal DML (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) on application tables. Explicitly prohibited from `TRUNCATE`, `TRIGGER`, or accessing `_prisma_migrations`.
+   - Row-Level Security (RLS): PostgreSQL kernel enforces tenant isolation on all tables via `current_setting('app.current_organization_id', true)`.
+
+### Step-by-Step Production Database Provisioning
 
 ```bash
-# 1. Apply migrations using canonical Prisma migration deployer
+# Step 1: Run schema migrations using the administrative owner role (DIRECT_URL)
 npx prisma migrate deploy --schema=prisma/schema.postgresql.prisma
 
-# 2. Apply PostgreSQL Row-Level Security (RLS) policies and least-privilege role definitions
-psql "$DIRECT_URL" -v ON_ERROR_STOP=1 -f prisma/rls_policies.sql
+# Step 2: Provision or rotate the unprivileged supportos_app role and RLS policies
+# Requires DIRECT_URL and APP_ROLE_PASSWORD in the environment
+APP_ROLE_PASSWORD="<GENERATED_STRONG_PASSWORD>" npm run db:provision-roles
 
-# 3. Seed initial master organization and administrative accounts
+# Step 3: Seed initial organization, admin accounts, and default inbox
 npx tsx prisma/seed.ts
+
+# Step 4: Verify RLS policies and table ownership via catalog inspection
+npm --prefix apps/api run test:postgres-rls
 ```
 
 ---
@@ -168,10 +191,11 @@ aws s3 cp "${BACKUP_FILE}.gpg" "s3://${BACKUP_S3_BUCKET}/postgres/supportos_${BA
    ```
 4. Re-apply Row-Level Security policies and unprivileged role definitions:
    ```bash
-   psql "$RESTORE_DIRECT_URL" -v ON_ERROR_STOP=1 -f prisma/rls_policies.sql
+   APP_ROLE_PASSWORD="$APP_ROLE_PASSWORD" npm run db:provision-roles
    ```
 5. Verify application data integrity:
    ```bash
    npm --prefix apps/api run test:postgres-rls
    npm --prefix apps/api run test:security
+   npm run audit:runtime
    ```

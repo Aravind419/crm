@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import * as jwt from 'jsonwebtoken';
 import { config } from '../config';
-import { prisma } from '../prisma';
+import { runInTenantContext } from '../tenancy/tenant-context';
 
 export interface AuthenticatedUser {
   id: string;
@@ -35,20 +35,28 @@ export async function authMiddleware(req: AuthenticatedRequest, res: Response, n
       role: string;
     };
 
-    const user = await prisma.user.findUnique({
-      where: { id: payload.userId },
-      select: {
-        id: true,
-        organizationId: true,
-        email: true,
-        role: true,
-        firstName: true,
-        lastName: true,
-        status: true,
-      },
-    });
+    if (!payload.userId || !payload.organizationId) {
+      res.status(401).json({ error: 'Unauthorized', message: 'Malformed session token payload' });
+      return;
+    }
 
-    if (!user || user.status !== 'ACTIVE') {
+    // Verify user under transaction-local PostgreSQL RLS context
+    const user = await runInTenantContext(payload.organizationId, async (tx) => {
+      return tx.user.findUnique({
+        where: { id: payload.userId },
+        select: {
+          id: true,
+          organizationId: true,
+          email: true,
+          role: true,
+          firstName: true,
+          lastName: true,
+          status: true,
+        },
+      });
+    }, { actorId: payload.userId, actorType: 'AGENT' });
+
+    if (!user || user.status !== 'ACTIVE' || user.organizationId !== payload.organizationId) {
       res.status(401).json({ error: 'Unauthorized', message: 'User account is inactive or not found' });
       return;
     }

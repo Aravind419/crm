@@ -4,7 +4,7 @@ import bcrypt from 'bcryptjs';
 import { prisma } from '../prisma';
 import { config } from '../config';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
-import { tenantIsolationGuard } from '../middleware/tenant';
+import { tenantIsolationGuard, tenantTransactionMiddleware } from '../middleware/tenant';
 import { requireRoles } from '../middleware/roles';
 import { EntitlementService } from '../services/entitlement.service';
 import { disconnectUserSockets } from '../services/socket.service';
@@ -14,6 +14,7 @@ const router = Router();
 
 router.use(authMiddleware);
 router.use(tenantIsolationGuard);
+router.use(tenantTransactionMiddleware);
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 

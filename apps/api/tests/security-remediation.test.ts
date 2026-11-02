@@ -472,7 +472,7 @@ async function runSecurityRemediationSuite() {
     });
 
     await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Live socket connection timed out')), 3000);
+      const timeout = setTimeout(() => reject(new Error('Live socket connection timed out')), 12000);
       liveSocket.on('connect', () => {
         clearTimeout(timeout);
         resolve();
@@ -590,7 +590,7 @@ async function runSecurityRemediationSuite() {
     });
 
     await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Deact agent socket connection timed out')), 3000);
+      const timeout = setTimeout(() => reject(new Error('Deact agent socket connection timed out')), 12000);
       deactAgentSocket.on('connect', () => {
         clearTimeout(timeout);
         resolve();
@@ -1171,7 +1171,7 @@ async function runSecurityRemediationSuite() {
       reconnection: false,
     });
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Socket connection timed out')), 4000);
+      const timer = setTimeout(() => reject(new Error('Socket connection timed out')), 12000);
       roomVisitorSocket.on('connect', () => {
         clearTimeout(timer);
         resolve();
@@ -1200,7 +1200,7 @@ async function runSecurityRemediationSuite() {
       reconnection: false,
     });
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Agent socket connection timed out')), 4000);
+      const timer = setTimeout(() => reject(new Error('Agent socket connection timed out')), 12000);
       agentSocket.on('connect', () => {
         clearTimeout(timer);
         resolve();

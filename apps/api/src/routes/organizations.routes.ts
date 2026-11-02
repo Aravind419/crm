@@ -3,9 +3,10 @@ import * as crypto from 'crypto';
 import { prisma } from '../prisma';
 import { config } from '../config';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
-import { tenantIsolationGuard } from '../middleware/tenant';
+import { tenantIsolationGuard, tenantTransactionMiddleware } from '../middleware/tenant';
 import { requireRoles } from '../middleware/roles';
 import { EntitlementService } from '../services/entitlement.service';
+import { runInTenantContext } from '../tenancy/tenant-context';
 import {
   isValidTimezone,
   isValidLocale,
@@ -122,7 +123,7 @@ router.post('/billing/webhook', async (req: Request, res: Response): Promise<voi
     // Atomic Transaction: WebhookEvent unique constraint + Organization Update + AuditEvent creation.
     // Never swallow database failures!
     try {
-      await prisma.$transaction(async (tx) => {
+      await runInTenantContext(organizationId, async (tx) => {
         // Record unique webhook event for database-level idempotency
         await tx.webhookEvent.create({
           data: {
@@ -152,7 +153,7 @@ router.post('/billing/webhook', async (req: Request, res: Response): Promise<voi
             metadata: JSON.stringify({ event, newPlan: plan, status }),
           },
         });
-      });
+      }, { actorType: 'SYSTEM' });
 
       res.json({ success: true, message: `Organization plan successfully updated to ${plan}` });
     } catch (txErr: any) {
@@ -178,6 +179,7 @@ router.post('/billing/webhook', async (req: Request, res: Response): Promise<voi
 // Protected routes below
 router.use(authMiddleware);
 router.use(tenantIsolationGuard);
+router.use(tenantTransactionMiddleware);
 
 /**
  * GET /api/v1/organizations/current

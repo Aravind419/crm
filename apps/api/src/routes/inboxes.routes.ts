@@ -2,7 +2,7 @@ import { Router, Response } from 'express';
 import * as crypto from 'crypto';
 import { prisma } from '../prisma';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
-import { tenantIsolationGuard } from '../middleware/tenant';
+import { tenantIsolationGuard, tenantTransactionMiddleware } from '../middleware/tenant';
 import { requireRoles } from '../middleware/roles';
 import { EntitlementService } from '../services/entitlement.service';
 
@@ -10,6 +10,7 @@ const router = Router();
 
 router.use(authMiddleware);
 router.use(tenantIsolationGuard);
+router.use(tenantTransactionMiddleware);
 
 /**
  * GET /api/v1/inboxes

@@ -1,12 +1,13 @@
 import { Router, Response } from 'express';
 import { prisma } from '../prisma';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
-import { tenantIsolationGuard } from '../middleware/tenant';
+import { tenantIsolationGuard, tenantTransactionMiddleware } from '../middleware/tenant';
 
 const router = Router();
 
 router.use(authMiddleware);
 router.use(tenantIsolationGuard);
+router.use(tenantTransactionMiddleware);
 
 /**
  * GET /api/v1/reports/overview

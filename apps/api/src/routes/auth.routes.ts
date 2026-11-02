@@ -5,8 +5,11 @@ import bcrypt from 'bcryptjs';
 import { prisma } from '../prisma';
 import { config } from '../config';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
+import { tenantTransactionMiddleware } from '../middleware/tenant';
 import { rateLimiter } from '../middleware/rate-limiter';
 import { disconnectUserSockets } from '../services/socket.service';
+import { runInTenantContext } from '../tenancy/tenant-context';
+import { AuthLookupService } from '../tenancy/auth-lookup.service';
 
 const router = Router();
 
@@ -52,21 +55,27 @@ export async function verifyPassword(password: string, hash: string): Promise<bo
   }
 }
 
-export async function createRefreshToken(userId: string, familyId?: string): Promise<string> {
+export async function createRefreshToken(userId: string, organizationId?: string, familyId?: string): Promise<string> {
   const rawToken = crypto.randomBytes(40).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   const expiresAt = new Date(Date.now() + config.refreshTokenExpiresDays * 24 * 60 * 60 * 1000);
   const actualFamilyId = familyId || crypto.randomUUID();
 
-  await prisma.refreshToken.create({
-    data: {
-      userId,
-      tokenHash,
-      familyId: actualFamilyId,
-      expiresAt,
-      revoked: false,
-    },
-  });
+  const insertData = {
+    userId,
+    tokenHash,
+    familyId: actualFamilyId,
+    expiresAt,
+    revoked: false,
+  };
+
+  if (organizationId) {
+    await runInTenantContext(organizationId, async (tx) => {
+      await tx.refreshToken.create({ data: insertData });
+    });
+  } else {
+    await prisma.refreshToken.create({ data: insertData });
+  }
 
   return rawToken;
 }
@@ -91,17 +100,19 @@ router.post('/signup', authRateLimiter, async (req: Request, res: Response): Pro
 
     const slug = (orgSlug || orgName.toLowerCase().replace(/[^a-z0-9]/g, '-')).replace(/--+/g, '-');
 
-    const existingOrg = await prisma.organization.findUnique({ where: { slug } });
+    const existingOrg = await AuthLookupService.lookupOrgBySlug(slug);
     if (existingOrg) {
       res.status(409).json({ error: 'Conflict', message: 'Organization slug is already taken' });
       return;
     }
 
     const hashedPassword = await hashPassword(password);
+    const newOrgId = crypto.randomUUID();
 
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await runInTenantContext(newOrgId, async (tx) => {
       const organization = await tx.organization.create({
         data: {
+          id: newOrgId,
           name: orgName,
           slug,
           plan: 'GROWTH',
@@ -143,7 +154,21 @@ router.post('/signup', authRateLimiter, async (req: Request, res: Response): Pro
         },
       });
 
-      return { organization, user, workspace, inbox };
+      const rawRefreshToken = crypto.randomBytes(40).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(rawRefreshToken).digest('hex');
+      const expiresAt = new Date(Date.now() + config.refreshTokenExpiresDays * 24 * 60 * 60 * 1000);
+
+      await tx.refreshToken.create({
+        data: {
+          userId: user.id,
+          tokenHash,
+          familyId: crypto.randomUUID(),
+          expiresAt,
+          revoked: false,
+        },
+      });
+
+      return { organization, user, workspace, inbox, refreshToken: rawRefreshToken };
     });
 
     const token = jwt.sign(
@@ -157,12 +182,10 @@ router.post('/signup', authRateLimiter, async (req: Request, res: Response): Pro
       { expiresIn: config.jwtExpiresIn as any }
     );
 
-    const refreshToken = await createRefreshToken(result.user.id);
-
     res.status(201).json({
       message: 'Organization and account successfully created',
       token,
-      refreshToken,
+      refreshToken: result.refreshToken,
       user: {
         id: result.user.id,
         email: result.user.email,
@@ -200,14 +223,7 @@ router.post('/login', authRateLimiter, async (req: Request, res: Response): Prom
       return;
     }
 
-    const user = await prisma.user.findFirst({
-      where: {
-        email: String(email).toLowerCase().trim(),
-      },
-      include: {
-        organization: true,
-      },
-    });
+    const user = await AuthLookupService.lookupUserByEmail(String(email));
 
     // Constant-time check mitigation: generic failure message for both non-existent user and wrong password
     if (!user) {
@@ -219,16 +235,6 @@ router.post('/login', authRateLimiter, async (req: Request, res: Response): Prom
     if (!isMatch) {
       res.status(401).json({ error: 'Unauthorized', message: 'Invalid email or password' });
       return;
-    }
-
-    // DYNAMIC HASH UPGRADE: If user authenticated with legacy SHA-256 hash, upgrade to bcrypt immediately
-    if (!user.passwordHash.startsWith('$2a$') && !user.passwordHash.startsWith('$2b$')) {
-      const modernBcryptHash = await hashPassword(password);
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { passwordHash: modernBcryptHash },
-      });
-      console.log(`[Security] Upgraded legacy password hash to bcrypt for user ${user.id}`);
     }
 
     if (user.status !== 'ACTIVE') {
@@ -247,20 +253,46 @@ router.post('/login', authRateLimiter, async (req: Request, res: Response): Prom
       { expiresIn: config.jwtExpiresIn as any }
     );
 
-    const refreshToken = await createRefreshToken(user.id);
+    const refreshToken = await runInTenantContext(user.organizationId, async (tx) => {
+      // DYNAMIC HASH UPGRADE: If user authenticated with legacy SHA-256 hash, upgrade to bcrypt immediately
+      if (!user.passwordHash.startsWith('$2a$') && !user.passwordHash.startsWith('$2b$')) {
+        const modernBcryptHash = await hashPassword(password);
+        await tx.user.update({
+          where: { id: user.id },
+          data: { passwordHash: modernBcryptHash },
+        });
+        console.log(`[Security] Upgraded legacy password hash to bcrypt for user ${user.id}`);
+      }
 
-    // Record audit event
-    await prisma.auditEvent.create({
-      data: {
-        organizationId: user.organizationId,
-        userId: user.id,
-        action: 'USER_LOGIN',
-        entityType: 'User',
-        entityId: user.id,
-        ipAddress: req.ip || req.socket.remoteAddress || null,
-        metadata: JSON.stringify({ email: user.email }),
-      },
-    }).catch(() => {});
+      const rawToken = crypto.randomBytes(40).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+      const expiresAt = new Date(Date.now() + config.refreshTokenExpiresDays * 24 * 60 * 60 * 1000);
+
+      await tx.refreshToken.create({
+        data: {
+          userId: user.id,
+          tokenHash,
+          familyId: crypto.randomUUID(),
+          expiresAt,
+          revoked: false,
+        },
+      });
+
+      // Record audit event
+      await tx.auditEvent.create({
+        data: {
+          organizationId: user.organizationId,
+          userId: user.id,
+          action: 'USER_LOGIN',
+          entityType: 'User',
+          entityId: user.id,
+          ipAddress: req.ip || req.socket.remoteAddress || null,
+          metadata: JSON.stringify({ email: user.email }),
+        },
+      }).catch(() => {});
+
+      return rawToken;
+    }, { actorId: user.id, actorType: 'AGENT' });
 
     res.json({
       token,
@@ -275,10 +307,10 @@ router.post('/login', authRateLimiter, async (req: Request, res: Response): Prom
         avatarUrl: user.avatarUrl,
       },
       organization: {
-        id: user.organization.id,
-        name: user.organization.name,
-        slug: user.organization.slug,
-        plan: user.organization.plan,
+        id: user.orgId,
+        name: user.orgName,
+        slug: user.orgSlug,
+        plan: user.orgPlan,
       },
     });
   } catch (err: any) {
@@ -302,9 +334,14 @@ router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
 
     const tokenHash = crypto.createHash('sha256').update(refreshToken.trim()).digest('hex');
 
-    // Atomic CAS rotation inside transaction to prevent concurrent refresh race conditions
-    const result = await prisma.$transaction(async (tx) => {
-      // 1. Atomically revoke ONLY if currently active and not expired, and record rotatedAt timestamp
+    const stored = await AuthLookupService.lookupRefreshToken(tokenHash);
+    if (!stored) {
+      res.status(401).json({ error: 'Unauthorized', message: 'Invalid, expired, or already used refresh token' });
+      return;
+    }
+
+    // Atomic CAS rotation inside transaction-local tenant context
+    const result = await runInTenantContext(stored.organizationId, async (tx) => {
       const now = new Date();
       const updateCount = await tx.refreshToken.updateMany({
         where: {
@@ -320,69 +357,53 @@ router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
 
       if (updateCount.count === 0) {
         // Token was already revoked, expired, or non-existent
-        const storedToken = await tx.refreshToken.findUnique({
-          where: { tokenHash },
-          include: { user: true },
-        });
-
-        if (storedToken && storedToken.revoked) {
-          // Distinguish near-simultaneous concurrency race from genuine later reuse attack
+        if (stored.revoked) {
           const isConcurrentRace =
-            storedToken.rotatedAt &&
-            Date.now() - storedToken.rotatedAt.getTime() < 10000; // 10s grace window for concurrent requests
+            stored.rotatedAt &&
+            Date.now() - stored.rotatedAt.getTime() < 10000; // 10s grace window for concurrent requests
 
           if (!isConcurrentRace) {
             // Genuine reuse attack! Invalidate ONLY this compromised token family
             await tx.refreshToken.updateMany({
-              where: { familyId: storedToken.familyId },
+              where: { familyId: stored.familyId },
               data: { revoked: true },
             });
 
             // Log security audit event without exposing raw tokens
             await tx.auditEvent.create({
               data: {
-                organizationId: storedToken.user.organizationId,
-                userId: storedToken.userId,
+                organizationId: stored.organizationId,
+                userId: stored.userId,
                 action: 'REFRESH_TOKEN_FAMILY_REVOKED',
                 entityType: 'RefreshTokenFamily',
-                entityId: storedToken.familyId,
+                entityId: stored.familyId,
                 ipAddress: req.ip || req.socket.remoteAddress || null,
                 metadata: JSON.stringify({
                   alert: 'Compromised refresh token reuse detected. Compromised token family revoked.',
-                  familyId: storedToken.familyId,
+                  familyId: stored.familyId,
                 }),
               },
-            });
+            }).catch(() => {});
           }
         }
 
         return null;
       }
 
-      // 2. Fetch the existing token with its familyId
-      const existingToken = await tx.refreshToken.findUnique({
-        where: { tokenHash },
-        include: {
-          user: {
-            include: { organization: true },
-          },
-        },
-      });
-
-      if (!existingToken || existingToken.user.status !== 'ACTIVE') {
+      if (stored.userStatus !== 'ACTIVE') {
         return null;
       }
 
-      // 3. Issue new refresh token within the same transaction, maintaining the SAME familyId
+      // Issue new refresh token within the same transaction, maintaining the SAME familyId
       const newRawToken = crypto.randomBytes(40).toString('hex');
       const newTokenHash = crypto.createHash('sha256').update(newRawToken).digest('hex');
       const newExpiresAt = new Date(Date.now() + config.refreshTokenExpiresDays * 24 * 60 * 60 * 1000);
 
       await tx.refreshToken.create({
         data: {
-          userId: existingToken.userId,
+          userId: stored.userId,
           tokenHash: newTokenHash,
-          familyId: existingToken.familyId,
+          familyId: stored.familyId,
           expiresAt: newExpiresAt,
           revoked: false,
         },
@@ -390,10 +411,10 @@ router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
 
       const newAccessToken = jwt.sign(
         {
-          userId: existingToken.user.id,
-          organizationId: existingToken.user.organizationId,
-          email: existingToken.user.email,
-          role: existingToken.user.role,
+          userId: stored.userId,
+          organizationId: stored.organizationId,
+          email: stored.email,
+          role: stored.role,
         },
         config.jwtSecret,
         { expiresIn: config.jwtExpiresIn as any }
@@ -431,14 +452,13 @@ router.post('/logout', async (req: Request, res: Response): Promise<void> => {
 
     if (refreshToken && typeof refreshToken === 'string') {
       const tokenHash = crypto.createHash('sha256').update(refreshToken.trim()).digest('hex');
-      const stored = await prisma.refreshToken.findUnique({
-        where: { tokenHash },
-        select: { userId: true, familyId: true },
-      });
+      const stored = await AuthLookupService.lookupRefreshToken(tokenHash);
       if (stored) {
-        await prisma.refreshToken.updateMany({
-          where: { familyId: stored.familyId },
-          data: { revoked: true },
+        await runInTenantContext(stored.organizationId, async (tx) => {
+          await tx.refreshToken.updateMany({
+            where: { familyId: stored.familyId },
+            data: { revoked: true },
+          });
         });
         disconnectUserSockets(stored.userId);
       }
@@ -453,51 +473,56 @@ router.post('/logout', async (req: Request, res: Response): Promise<void> => {
 /**
  * GET /api/v1/auth/me
  */
-router.get('/me', authMiddleware, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  try {
-    const user = await prisma.user.findUnique({
-      where: { id: req.user!.id },
-      include: {
-        organization: {
-          select: {
-            id: true,
-            name: true,
-            slug: true,
-            plan: true,
-            status: true,
-            createdAt: true,
+router.get(
+  '/me',
+  authMiddleware,
+  tenantTransactionMiddleware,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: req.user!.id },
+        include: {
+          organization: {
+            select: {
+              id: true,
+              name: true,
+              slug: true,
+              plan: true,
+              status: true,
+              createdAt: true,
+            },
+          },
+          teamMemberships: {
+            include: {
+              team: true,
+            },
           },
         },
-        teamMemberships: {
-          include: {
-            team: true,
-          },
-        },
-      },
-    });
+      });
 
-    if (!user) {
-      res.status(404).json({ error: 'Not Found', message: 'User not found' });
-      return;
+      if (!user) {
+        res.status(404).json({ error: 'Not Found', message: 'User not found' });
+        return;
+      }
+
+      res.json({
+        user: {
+          id: user.id,
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          role: user.role,
+          isAvailable: user.isAvailable,
+          avatarUrl: user.avatarUrl,
+          teams: user.teamMemberships.map((m) => ({ id: m.team.id, name: m.team.name })),
+        },
+        organization: user.organization,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: 'Internal Server Error', message: 'Failed to retrieve profile' });
     }
-
-    res.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        role: user.role,
-        isAvailable: user.isAvailable,
-        avatarUrl: user.avatarUrl,
-        teams: user.teamMemberships.map((m) => ({ id: m.team.id, name: m.team.name })),
-      },
-      organization: user.organization,
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to retrieve profile' });
   }
-});
+);
 
 /**
  * GET /api/v1/auth/invitations/:token
@@ -513,20 +538,7 @@ router.get('/invitations/:token', async (req: Request, res: Response): Promise<v
 
     const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
 
-    const user = await prisma.user.findUnique({
-      where: { invitationTokenHash: tokenHash },
-      include: {
-        organization: {
-          select: {
-            id: true,
-            name: true,
-            slug: true,
-            logoUrl: true,
-            brandColor: true,
-          },
-        },
-      },
-    });
+    const user = await AuthLookupService.lookupUserByInvitation(tokenHash);
 
     if (!user) {
       res.status(404).json({ error: 'Not Found', message: 'Invalid or already used invitation token' });
@@ -549,8 +561,14 @@ router.get('/invitations/:token', async (req: Request, res: Response): Promise<v
       firstName: user.firstName,
       lastName: user.lastName,
       role: user.role,
-      organization: user.organization,
-      organizationName: user.organization.name,
+      organization: {
+        id: user.orgId,
+        name: user.orgName,
+        slug: user.orgSlug,
+        logoUrl: user.orgLogoUrl,
+        brandColor: user.orgBrandColor,
+      },
+      organizationName: user.orgName,
       inviterName: 'Administrator',
       expiresAt: user.invitationExpiresAt,
       invitation: {
@@ -558,8 +576,14 @@ router.get('/invitations/:token', async (req: Request, res: Response): Promise<v
         firstName: user.firstName,
         lastName: user.lastName,
         role: user.role,
-        organizationName: user.organization.name,
-        organization: user.organization,
+        organizationName: user.orgName,
+        organization: {
+          id: user.orgId,
+          name: user.orgName,
+          slug: user.orgSlug,
+          logoUrl: user.orgLogoUrl,
+          brandColor: user.orgBrandColor,
+        },
         inviterName: 'Administrator',
         expiresAt: user.invitationExpiresAt,
       },
@@ -600,34 +624,26 @@ router.post('/invitations/accept', authRateLimiter, async (req: Request, res: Re
     const now = new Date();
     const hashedPassword = await hashPassword(password);
 
-    // Atomic transaction: Execute conditional update directly on database
-    const { updatedUser, organization } = await prisma.$transaction(async (tx) => {
-      // Find candidate by token hash first
-      const candidate = await tx.user.findUnique({
-        where: { invitationTokenHash: tokenHash },
-        include: { organization: true },
-      });
+    const candidate = await AuthLookupService.lookupUserByInvitation(tokenHash);
 
-      if (!candidate) {
-        const err: any = new Error('Invalid or already used invitation token');
-        err.status = 404;
-        throw err;
-      }
+    if (!candidate) {
+      res.status(404).json({ error: 'Not Found', message: 'Invalid or already used invitation token' });
+      return;
+    }
 
-      if (candidate.status !== 'INVITED') {
-        const err: any = new Error('This invitation has already been accepted');
-        err.status = 400;
-        throw err;
-      }
+    if (candidate.status !== 'INVITED') {
+      res.status(400).json({ error: 'Bad Request', message: 'This invitation has already been accepted' });
+      return;
+    }
 
-      if (!candidate.invitationExpiresAt || candidate.invitationExpiresAt <= now) {
-        const err: any = new Error('This invitation has expired. Please request a new invitation.');
-        err.status = 410;
-        throw err;
-      }
+    if (!candidate.invitationExpiresAt || candidate.invitationExpiresAt <= now) {
+      res.status(410).json({ error: 'Gone', message: 'This invitation has expired. Please request a new invitation.' });
+      return;
+    }
 
-      // ATOMIC CONDITIONAL CONSUMPTION
-      // Exactly one concurrent transaction can match status='INVITED' and valid tokenHash
+    // Atomic transaction under transaction-local PostgreSQL RLS context
+    const { updatedUser, organization } = await runInTenantContext(candidate.organizationId, async (tx) => {
+      // ATOMIC CONDITIONAL CONSUMPTION: exactly one concurrent transaction can succeed
       const updateResult = await tx.user.updateMany({
         where: {
           id: candidate.id,
@@ -646,15 +662,17 @@ router.post('/invitations/accept', authRateLimiter, async (req: Request, res: Re
       });
 
       if (updateResult.count !== 1) {
-        // Race condition: another concurrent request consumed this invitation first
         const err: any = new Error('This invitation has already been accepted or is currently being processed');
         err.status = 409;
         throw err;
       }
 
-      // Fetch the updated user record
       const activated = await tx.user.findUniqueOrThrow({
         where: { id: candidate.id },
+      });
+
+      const org = await tx.organization.findUniqueOrThrow({
+        where: { id: candidate.organizationId },
       });
 
       // Write audit event
@@ -670,7 +688,7 @@ router.post('/invitations/accept', authRateLimiter, async (req: Request, res: Re
         },
       });
 
-      return { updatedUser: activated, organization: candidate.organization };
+      return { updatedUser: activated, organization: org };
     });
 
     const jwtToken = jwt.sign(
@@ -684,12 +702,12 @@ router.post('/invitations/accept', authRateLimiter, async (req: Request, res: Re
       { expiresIn: config.jwtExpiresIn as any }
     );
 
-    const refreshToken = await createRefreshToken(updatedUser.id);
+    const rawRefreshToken = await createRefreshToken(updatedUser.id, updatedUser.organizationId);
 
     res.json({
       message: 'Account successfully activated',
       token: jwtToken,
-      refreshToken,
+      refreshToken: rawRefreshToken,
       user: {
         id: updatedUser.id,
         email: updatedUser.email,

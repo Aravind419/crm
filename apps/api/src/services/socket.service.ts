@@ -6,6 +6,8 @@ import * as jwt from 'jsonwebtoken';
 import * as crypto from 'crypto';
 import { config } from '../config';
 import { prisma } from '../prisma';
+import { runInTenantContext } from '../tenancy/tenant-context';
+import { AuthLookupService } from '../tenancy/auth-lookup.service';
 
 let io: SocketIOServer | null = null;
 let pubClient: Redis | null = null;
@@ -90,11 +92,13 @@ export function initSocketService(server: HttpServer): SocketIOServer {
             role: string;
           };
 
-          // Verify agent exists and status is ACTIVE
-          const user = await prisma.user.findUnique({
-            where: { id: payload.userId },
-            select: { id: true, organizationId: true, status: true, role: true },
-          });
+          // Verify agent exists and status is ACTIVE under transaction-local RLS
+          const user = await runInTenantContext(payload.organizationId, async (tx) => {
+            return tx.user.findUnique({
+              where: { id: payload.userId },
+              select: { id: true, organizationId: true, status: true, role: true },
+            });
+          }, { actorId: payload.userId, actorType: 'AGENT' });
 
           if (user && user.status === 'ACTIVE' && user.organizationId === payload.organizationId) {
             socket.data.userId = user.id;
@@ -122,17 +126,8 @@ export function initSocketService(server: HttpServer): SocketIOServer {
 
         const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
 
-        // Look up verified visitor session strictly by SHA-256 tokenHash
-        const session = await prisma.visitorSession.findFirst({
-          where: { tokenHash },
-          select: {
-            id: true,
-            customerId: true,
-            conversationId: true,
-            expiresAt: true,
-            revokedAt: true,
-          },
-        });
+        // Look up verified visitor session via pre-auth helper
+        const session = await AuthLookupService.lookupVisitorSession(tokenHash);
 
         if (!session) {
           return next(new Error('Authentication failed: Invalid visitor session credentials'));
@@ -155,6 +150,7 @@ export function initSocketService(server: HttpServer): SocketIOServer {
         socket.data.tokenHash = tokenHash;
         socket.data.conversationId = convId;
         socket.data.customerId = session.customerId;
+        socket.data.organizationId = session.organizationId;
         socket.data.isVisitor = true;
         return next();
       }
@@ -184,24 +180,29 @@ export function initSocketService(server: HttpServer): SocketIOServer {
     }
 
     // Explicit room join request with authorization enforcement
-    socket.on('join:conversation', async (conversationId: string) => {
+    socket.on('join:conversation', async (dataOrId: any) => {
       try {
+        const conversationId = typeof dataOrId === 'string' ? dataOrId : dataOrId?.conversationId;
         if (!conversationId) return;
 
         // Rule A: Agents can only join conversations within their own organization
         if (socket.data.isAgent && socket.data.organizationId) {
-          const conv = await prisma.conversation.findFirst({
-            where: {
-              id: conversationId,
-              organizationId: socket.data.organizationId,
-            },
-            select: { id: true },
-          });
+          const conv = await runInTenantContext(socket.data.organizationId, async (tx) => {
+            return tx.conversation.findFirst({
+              where: {
+                id: conversationId,
+                organizationId: socket.data.organizationId,
+              },
+              select: { id: true },
+            });
+          }, { actorId: socket.data.userId, actorType: 'AGENT' });
 
           if (conv) {
             socket.join(`conv:${conversationId}`);
+            socket.emit('joined:conversation', { conversationId });
           } else {
             console.warn(`[Socket Security] Unauthorized agent conversation join attempt blocked for org ${socket.data.organizationId}`);
+            socket.emit('join:conversation:error', { message: 'Cross-tenant conversation access denied' });
             socket.emit('error:unauthorized', { message: 'Cross-tenant conversation access denied' });
           }
           return;
@@ -211,16 +212,20 @@ export function initSocketService(server: HttpServer): SocketIOServer {
         if (socket.data.isVisitor && socket.data.conversationId) {
           if (socket.data.conversationId === conversationId) {
             socket.join(`conv:${conversationId}`);
+            socket.emit('joined:conversation', { conversationId });
           } else {
             console.warn(`[Socket Security] Visitor attempted to join unauthorized conversation ${conversationId}`);
+            socket.emit('join:conversation:error', { message: 'Visitor cannot access other conversations' });
             socket.emit('error:unauthorized', { message: 'Visitor cannot access other conversations' });
           }
           return;
         }
 
+        socket.emit('join:conversation:error', { message: 'Authentication required to join conversation rooms' });
         socket.emit('error:unauthorized', { message: 'Authentication required to join conversation rooms' });
       } catch (err) {
         console.error('[Socket Join Error]:', err);
+        socket.emit('join:conversation:error', { message: 'Failed to join conversation room' });
       }
     });
 

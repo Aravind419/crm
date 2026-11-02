@@ -25,29 +25,36 @@ export const config = {
     : 'https://app.supportos.dev',
 };
 
-export function validateSecurityConfig(cfg = config): void {
-  if (cfg.nodeEnv === 'production') {
-    if (!cfg.jwtSecret || cfg.jwtSecret.includes('dev_secret') || cfg.jwtSecret.length < 32) {
+export function validateSecurityConfig(customCfg?: Partial<typeof config>): void {
+  const nodeEnv = customCfg?.nodeEnv ?? process.env.NODE_ENV ?? config.nodeEnv;
+  const jwtSecret = customCfg?.jwtSecret ?? process.env.JWT_SECRET ?? config.jwtSecret;
+  const billingWebhookSecret = customCfg?.billingWebhookSecret ?? process.env.BILLING_WEBHOOK_SECRET ?? config.billingWebhookSecret;
+  const requireRedis = customCfg?.requireRedis ?? (process.env.REQUIRE_REDIS === 'true');
+  const redisUrl = customCfg?.redisUrl !== undefined ? customCfg.redisUrl : (process.env.REDIS_URL || null);
+  const corsOrigins = customCfg?.corsOrigins ?? config.corsOrigins;
+
+  if (nodeEnv === 'production') {
+    if (!jwtSecret || jwtSecret.includes('dev_secret') || jwtSecret.length < 32) {
       throw new Error(
         '[CRITICAL SECURITY ERROR] Insecure or missing JWT_SECRET in production environment. A cryptographically strong secret (>= 32 characters) must be configured.'
       );
     }
-    if (!cfg.billingWebhookSecret || cfg.billingWebhookSecret.includes('dev_billing') || cfg.billingWebhookSecret.length < 32) {
+    if (!billingWebhookSecret || billingWebhookSecret.includes('dev_billing') || billingWebhookSecret.length < 32) {
       throw new Error(
         '[CRITICAL SECURITY ERROR] Insecure or missing BILLING_WEBHOOK_SECRET in production environment. A cryptographically strong secret (>= 32 characters) must be configured.'
       );
     }
-    if (cfg.requireRedis && (!cfg.redisUrl || !cfg.redisUrl.trim())) {
+    if (requireRedis && (!redisUrl || !redisUrl.trim())) {
       throw new Error(
         '[CRITICAL SECURITY ERROR] REQUIRE_REDIS=true is set in production, but REDIS_URL is not configured. Distributed deployment requires a valid Redis connection string.'
       );
     }
-    if (cfg.corsOrigins.includes('*')) {
+    if (corsOrigins.includes('*')) {
       throw new Error(
         '[CRITICAL SECURITY ERROR] CORS_ORIGIN cannot contain wildcard "*" in production because administrative credentials (cookies/authorization headers) are supported. Specify explicit origin domains.'
       );
     }
-    for (const origin of cfg.corsOrigins) {
+    for (const origin of corsOrigins) {
       try {
         const parsed = new URL(origin);
         if (!['http:', 'https:'].includes(parsed.protocol)) {
