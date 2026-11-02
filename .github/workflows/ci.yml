@@ -99,6 +99,7 @@ jobs:
       JWT_SECRET: supportos_ci_test_secret_key_random_long_string_2026
       BILLING_WEBHOOK_SECRET: supportos_ci_billing_secret_key_random_long_string_2026
       DATABASE_URL: "postgresql://supportos_user:supportos_ci_secure_password_2026@localhost:5432/supportos_prod_test?schema=public"
+      DIRECT_URL: "postgresql://supportos_user:supportos_ci_secure_password_2026@localhost:5432/supportos_prod_test?schema=public"
       REDIS_URL: "redis://localhost:6379"
       REQUIRE_REDIS: "true"
 
@@ -115,10 +116,10 @@ jobs:
       - name: Install Workspace Dependencies
         run: npm install
 
-      - name: Setup PostgreSQL Schema & Database Push
+      - name: Setup PostgreSQL Schema & Database Migrations
         run: |
           npx prisma generate --schema=prisma/schema.postgresql.prisma
-          npx prisma db push --schema=prisma/schema.postgresql.prisma
+          npx prisma migrate deploy --schema=prisma/schema.postgresql.prisma
 
       - name: Seed PostgreSQL Database
         run: npx tsx prisma/seed.ts

@@ -27,9 +27,29 @@ async function runPostgresRlsTests() {
   });
 
   try {
-    // 1. Verify RLS is enabled in pg_class
+    // 1. Verify RLS is enabled in pg_class across all tenant tables
     console.log('1. Verifying PostgreSQL pg_class table security attributes...');
-    const tables = ['conversations', 'messages', 'tickets', 'customers', 'inboxes'];
+    const tables = [
+      'organizations',
+      'workspaces',
+      'users',
+      'teams',
+      'team_members',
+      'inboxes',
+      'customers',
+      'conversations',
+      'messages',
+      'attachments',
+      'tickets',
+      'ticket_comments',
+      'categories',
+      'articles',
+      'automation_rules',
+      'audit_events',
+      'refresh_tokens',
+      'webhook_events',
+      'visitor_sessions',
+    ];
     for (const table of tables) {
       const classInfo: any[] = await prisma.$queryRawUnsafe(`
         SELECT relname, relrowsecurity 
@@ -41,7 +61,7 @@ async function runPostgresRlsTests() {
       console.log(`   ✅ PASS: Table "${table}" has Row-Level Security (RLS) enabled.`);
     }
 
-    // 2. Verify pg_policies definitions
+    // 2. Verify pg_policies definitions across all tenant tables
     console.log('\n2. Verifying PostgreSQL pg_policies definitions...');
     for (const table of tables) {
       const policies: any[] = await prisma.$queryRawUnsafe(`
@@ -73,59 +93,65 @@ async function runPostgresRlsTests() {
 
     // 4. Test RLS Read Isolation using unprivileged supportos_app connection
     console.log('\n3. Testing PostgreSQL RLS Read Isolation under supportos_app connection...');
-    await appPrisma.$transaction(async (tx) => {
-      // Set session setting to Acme
-      await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${acmeOrg.id}';`);
+    await appPrisma.$transaction(
+      async (tx) => {
+        // Set session setting to Acme
+        await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${acmeOrg.id}';`);
 
-      const acmeConvRows: any[] = await tx.$queryRawUnsafe(`SELECT * FROM "conversations";`);
-      assert.ok(acmeConvRows.length > 0, 'Acme must see its own conversations under its session context');
-      for (const row of acmeConvRows) {
-        const rowOrgId = row.organizationId || row.organization_id;
-        assert.strictEqual(rowOrgId, acmeOrg.id, 'Every visible row must belong to Acme');
-      }
+        const acmeConvRows: any[] = await tx.$queryRawUnsafe(`SELECT * FROM "conversations";`);
+        assert.ok(acmeConvRows.length > 0, 'Acme must see its own conversations under its session context');
+        for (const row of acmeConvRows) {
+          const rowOrgId = row.organizationId || row.organization_id;
+          assert.strictEqual(rowOrgId, acmeOrg.id, 'Every visible row must belong to Acme');
+        }
 
-      const starlightConvsUnderAcme: any[] = await tx.$queryRawUnsafe(
-        `SELECT * FROM "conversations" WHERE "organizationId" = '${starlightOrg.id}';`
-      );
-      assert.strictEqual(starlightConvsUnderAcme.length, 0, 'Acme context must see 0 rows for Starlight');
-      console.log('   ✅ PASS: Acme session setting strictly isolates reading to Acme rows.');
+        const starlightConvsUnderAcme: any[] = await tx.$queryRawUnsafe(
+          `SELECT * FROM "conversations" WHERE "organizationId" = '${starlightOrg.id}';`
+        );
+        assert.strictEqual(starlightConvsUnderAcme.length, 0, 'Acme context must see 0 rows for Starlight');
+        console.log('   ✅ PASS: Acme session setting strictly isolates reading to Acme rows.');
 
-      // Switch session setting to Starlight
-      await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${starlightOrg.id}';`);
+        // Switch session setting to Starlight
+        await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${starlightOrg.id}';`);
 
-      const starlightConvRows: any[] = await tx.$queryRawUnsafe(`SELECT * FROM "conversations";`);
-      assert.ok(starlightConvRows.length > 0, 'Starlight must see its own conversations under its session context');
-      for (const row of starlightConvRows) {
-        const rowOrgId = row.organizationId || row.organization_id;
-        assert.strictEqual(rowOrgId, starlightOrg.id, 'Every visible row must belong to Starlight');
-      }
+        const starlightConvRows: any[] = await tx.$queryRawUnsafe(`SELECT * FROM "conversations";`);
+        assert.ok(starlightConvRows.length > 0, 'Starlight must see its own conversations under its session context');
+        for (const row of starlightConvRows) {
+          const rowOrgId = row.organizationId || row.organization_id;
+          assert.strictEqual(rowOrgId, starlightOrg.id, 'Every visible row must belong to Starlight');
+        }
 
-      const acmeConvsUnderStarlight: any[] = await tx.$queryRawUnsafe(
-        `SELECT * FROM "conversations" WHERE "organizationId" = '${acmeOrg.id}';`
-      );
-      assert.strictEqual(acmeConvsUnderStarlight.length, 0, 'Starlight context must see 0 rows for Acme');
-      console.log('   ✅ PASS: Starlight session setting strictly isolates reading to Starlight rows.');
+        const acmeConvsUnderStarlight: any[] = await tx.$queryRawUnsafe(
+          `SELECT * FROM "conversations" WHERE "organizationId" = '${acmeOrg.id}';`
+        );
+        assert.strictEqual(acmeConvsUnderStarlight.length, 0, 'Starlight context must see 0 rows for Acme');
+        console.log('   ✅ PASS: Starlight session setting strictly isolates reading to Starlight rows.');
 
-      // Unset session setting: must see 0 rows
-      await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '';`);
-      const emptyConvRows: any[] = await tx.$queryRawUnsafe(`SELECT * FROM "conversations";`);
-      assert.strictEqual(emptyConvRows.length, 0, 'Unset session context must return 0 rows for conversations');
-      console.log('   ✅ PASS: Empty session setting returns 0 rows across tenant tables.');
-    });
+        // Unset session setting: must see 0 rows
+        await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '';`);
+        const emptyConvRows: any[] = await tx.$queryRawUnsafe(`SELECT * FROM "conversations";`);
+        assert.strictEqual(emptyConvRows.length, 0, 'Unset session context must return 0 rows for conversations');
+        console.log('   ✅ PASS: Empty session setting returns 0 rows across tenant tables.');
+      },
+      { timeout: 30000, maxWait: 15000 }
+    );
 
     // 5. Test RLS Write Violation (INSERT check violation) under supportos_app connection
     console.log('\n4. Testing PostgreSQL RLS Write Isolation (CHECK violation)...');
     let rlsBlocked = false;
     try {
-      await appPrisma.$transaction(async (tx) => {
-        await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${acmeOrg.id}';`);
+      await appPrisma.$transaction(
+        async (tx) => {
+          await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${acmeOrg.id}';`);
 
-        const dummyId = 'test-rls-violation-' + Date.now();
-        await tx.$executeRawUnsafe(`
-          INSERT INTO "conversations" ("id", "organizationId", "inboxId", "customerId", "status", "priority", "lastMessageAt", "createdAt", "updatedAt")
-          VALUES ('${dummyId}', '${starlightOrg.id}', '${starlightInbox.id}', '${starlightCustomer.id}', 'OPEN'::"ConversationStatus", 'MEDIUM'::"Priority", NOW(), NOW(), NOW());
-        `);
-      });
+          const dummyId = 'test-rls-violation-' + Date.now();
+          await tx.$executeRawUnsafe(`
+            INSERT INTO "conversations" ("id", "organizationId", "inboxId", "customerId", "status", "priority", "lastMessageAt", "createdAt", "updatedAt")
+            VALUES ('${dummyId}', '${starlightOrg.id}', '${starlightInbox.id}', '${starlightCustomer.id}', 'OPEN'::"ConversationStatus", 'MEDIUM'::"Priority", NOW(), NOW(), NOW());
+          `);
+        },
+        { timeout: 30000, maxWait: 15000 }
+      );
     } catch (err: any) {
       rlsBlocked = true;
       assert.ok(
