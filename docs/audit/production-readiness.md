@@ -9,20 +9,21 @@
 
 ## 1. Production Readiness Scorecard
 
-| Domain | Readiness Rating | Implementation Status | Audit Status |
-| :--- | :--- | :--- | :--- |
-| **Code Originality** | **100% Ready** | Clean-room implementation, independent product identity, zero copied code. | **VERIFIED** |
-| **API Functionality** | **100% Ready** | All core CRUD, dual-mode messaging, ticket escalations, automations verified. | **VERIFIED** |
-| **Visitor Auth & IDOR** | **100% Ready** | Cryptographic SHA-256 session hash lookup; strict conversation binding. | **VERIFIED** |
-| **Real-Time Gateway** | **100% Ready** | Real-time session revocation disconnection engine; origin security enforced. | **VERIFIED** |
-| **Token Lifecycle & Concurrency** | **100% Ready** | Token family tracking (`familyId`), CAS rotation, 10s grace window for concurrency races, targeted family revocation. | **VERIFIED** |
-| **Billing Webhook Security** | **100% Ready** | Strict canonical `${timestamp}.${rawPayload}` HMAC, mandatory 300s timestamp, mandatory event ID, atomic DB transaction with `WebhookEvent` unique constraint. | **VERIFIED** |
-| **Distributed Rate Limiting** | **95% Ready** | Redis Lua script rate limiter with safe IP extraction; single-instance in-memory fallback. | **VERIFIED** |
-| **Multi-Tenant Security** | **90% Ready** | Server-side tenant resolution on all queries; dual PostgreSQL RLS schema configured. | **PARTIALLY VERIFIED** (PostgreSQL RLS pending prod deploy) |
-| **CI/CD Pipeline** | **95% Ready** | GitHub Actions workflow fixed with `npx prisma db seed` via `tsx`; runs all test suites. | **VERIFIED** |
-| **Dependency Vulnerabilities** | **85% Ready** | `deepmerge-ts` resolved; `postcss` nested in `next@15` identified as build-time only. | **PARTIALLY VERIFIED** |
-| **Containerization** | **90% Ready** | Multi-stage Dockerfiles for API and Web; compose orchestration ready. | **NOT TESTED** in cloud cluster |
-| **Observability** | **80% Ready** | Audit events persisted to database; needs structured JSON logs (Pino) & APM in production. | **PARTIALLY VERIFIED** |
+| Domain | Implementation & Defense Mechanism | Audit Status |
+| :--- | :--- | :--- |
+| **Code Originality** | Clean-room implementation, independent product identity, zero copied code. | **VERIFIED** |
+| **API Functionality** | All core CRUD, dual-mode messaging, ticket escalations, automations verified. | **VERIFIED** |
+| **Visitor Auth & IDOR** | Cryptographic SHA-256 session hash lookup; strict conversation binding. | **VERIFIED** |
+| **Real-Time Gateway** | Distributed room-based session revocation disconnection; origin security enforced. | **VERIFIED** |
+| **Token Lifecycle & Concurrency** | Token family tracking (`familyId`), CAS rotation, 10s grace window for concurrency races, targeted family revocation. | **VERIFIED** |
+| **Billing Webhook Security** | Strict canonical `${timestamp}.${rawPayload}` HMAC, mandatory 300s timestamp, mandatory event ID, atomic DB transaction with `WebhookEvent` unique constraint. | **VERIFIED** |
+| **Distributed Rate Limiting** | Redis Lua script rate limiter with safe IP extraction; 503 fail-safe on outage; single-instance in-memory fallback. | **VERIFIED** |
+| **Multi-Tenant Security** | Server-side tenant resolution on all queries; PostgreSQL RLS policies in `prisma/rls_policies.sql`. Verified in GitHub Actions PostgreSQL service job. | **VERIFIED** |
+| **Password Migration** | Automatic in-place migration on login to bcrypt with timing-safe legacy SHA-256 fallback. Seed modernized to bcrypt. | **VERIFIED** |
+| **CI/CD Pipeline** | Dual-job GitHub Actions workflow: SQLite core suite + PostgreSQL 16 & Redis 7 service verification. | **VERIFIED** |
+| **Dependency Security** | `deepmerge-ts` resolved; automated `audit:check` in CI; build-time PostCSS exception documented. | **PARTIALLY VERIFIED** |
+| **Containerization** | Multi-stage Dockerfiles for API and Web; compose orchestration defined. | **NOT TESTED** in cloud cluster |
+| **Observability** | Audit events persisted to database; structured JSON logging and APM pending production setup. | **PARTIALLY VERIFIED** |
 
 ---
 
@@ -65,7 +66,7 @@ REQUIRE_REDIS=true
 TRUST_PROXY=true
 
 # Origin Security Policies
-CORS_ORIGINS=https://app.supportos.io,https://admin.supportos.io
+CORS_ORIGIN=https://app.supportos.io,https://admin.supportos.io
 ALLOWED_WIDGET_ORIGINS=*
 
 # Public URLs

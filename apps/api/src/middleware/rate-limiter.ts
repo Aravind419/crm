@@ -151,6 +151,13 @@ export function rateLimiter(options: {
       next();
     } catch (err: any) {
       console.error('[Rate Limiter Internal Error]:', err);
+      if (config.nodeEnv === 'production' || config.requireRedis) {
+        res.status(503).json({
+          error: 'Service Unavailable',
+          message: 'Distributed rate limiting check encountered an unexpected error',
+        });
+        return;
+      }
       next();
     }
   };

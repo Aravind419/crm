@@ -4,7 +4,9 @@ import * as crypto from 'crypto';
 import { io as ClientIO } from 'socket.io-client';
 import { app, server } from '../src/server';
 import { prisma } from '../src/prisma';
-import { config } from '../src/config';
+import { config, validateSecurityConfig } from '../src/config';
+import { disconnectVisitorSockets, disconnectUserSockets } from '../src/services/socket.service';
+import { rateLimiter } from '../src/middleware/rate-limiter';
 
 const TEST_PORT = 4996;
 
@@ -53,6 +55,17 @@ function request(options: {
 async function runSecurityRemediationSuite() {
   console.log('🛡️ Starting SupportOS Rigorous Comprehensive Security Verification Suite...\n');
 
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('FATAL: Refusing to execute test suite in production environment (NODE_ENV=production)');
+  }
+  if (
+    process.env.DATABASE_URL &&
+    process.env.DATABASE_URL.includes('prod') &&
+    !process.env.DATABASE_URL.includes('prod_test')
+  ) {
+    throw new Error('FATAL: Refusing to execute test suite against production database URL');
+  }
+
   await new Promise<void>((resolve) => {
     server.listen(TEST_PORT, () => {
       console.log(`[Remediation Test Server] Bound to http://localhost:${TEST_PORT}`);
@@ -62,6 +75,7 @@ async function runSecurityRemediationSuite() {
 
   const createdSessionIds: string[] = [];
   const createdUserIds: string[] = [];
+  const createdWebhookEventIds: string[] = [];
 
   try {
     // 0. Setup: Authenticate Org A (Alex Acme) & Org B (Maya Starlight)
@@ -208,6 +222,9 @@ async function runSecurityRemediationSuite() {
     // Test 5: Legacy plaintext token stored in customer.customAttributes cannot authenticate
     console.log('5. Testing: Legacy plaintext token in customer.customAttributes rejected (no fallback)...');
     const legacyPlaintextToken = `legacy_plain_${crypto.randomBytes(16).toString('hex')}`;
+    const origCustomer = await prisma.customer.findUnique({ where: { id: convA.customerId } });
+    const originalCustomAttributes = origCustomer?.customAttributes || null;
+
     // Inject into customer custom attributes
     await prisma.customer.update({
       where: { id: convA.customerId },
@@ -221,6 +238,12 @@ async function runSecurityRemediationSuite() {
     });
     assert.strictEqual(test5.status, 403, 'Plaintext token in customAttributes must be rejected with 403');
     console.log('   ✅ PASS: Legacy plaintext token rejected without SHA-256 VisitorSession record (HTTP 403)');
+
+    // Restore original customer customAttributes immediately
+    await prisma.customer.update({
+      where: { id: convA.customerId },
+      data: { customAttributes: originalCustomAttributes },
+    });
 
     // Test 6: Public write denied without visitor token
     console.log('6. Testing: Public write denied without visitor token...');
@@ -776,6 +799,7 @@ async function runSecurityRemediationSuite() {
     console.log('\n--- SECTION 5: STRICT BILLING WEBHOOK PROTOCOL & ATOMIC IDEMPOTENCY ---');
 
     const testEventId = `evt_billing_${Date.now()}`;
+    createdWebhookEventIds.push(testEventId);
     const webhookPayload = JSON.stringify({
       id: testEventId,
       event: 'subscription.updated',
@@ -943,6 +967,7 @@ async function runSecurityRemediationSuite() {
     // Test 33: Concurrent duplicate requests handled safely and idempotently
     console.log('33. Testing: Concurrent duplicate webhook deliveries handled safely and idempotently...');
     const concurrentEventId = `evt_concurrent_${Date.now()}`;
+    createdWebhookEventIds.push(concurrentEventId);
     const concurrentPayload = JSON.stringify({
       id: concurrentEventId,
       event: 'subscription.updated',
@@ -1108,8 +1133,211 @@ async function runSecurityRemediationSuite() {
     config.requireRedis = false; // Reset to default
     console.log('   ✅ PASS: Distributed rate limiter fails safely with HTTP 503 when required Redis is unavailable');
 
+    // Test 38: WebSocket room-based distributed disconnection for revoked visitor session
+    console.log('\n38. Testing: WebSocket room-based distributed disconnection for revoked visitor session...');
+    const liveVisitorRes = await request({
+      method: 'POST',
+      path: '/api/v1/public/conversations',
+      body: {
+        inboxKey: inboxAKey,
+        customerEmail: `visitor_room_${Date.now()}@example.com`,
+        customerName: 'Room Visitor',
+        message: 'Hello room test',
+      },
+    });
+    assert.strictEqual(liveVisitorRes.status, 201);
+    const roomVisitorToken = liveVisitorRes.data.visitorToken;
+    const roomConvId = liveVisitorRes.data.conversationId;
+    const roomTokenHash = crypto.createHash('sha256').update(roomVisitorToken).digest('hex');
+    createdSessionIds.push(liveVisitorRes.data.sessionId);
+
+    const roomVisitorSocket = ClientIO(`http://localhost:${TEST_PORT}`, {
+      transports: ['websocket'],
+      auth: { visitorToken: roomVisitorToken, conversationId: roomConvId },
+      reconnection: false,
+    });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Socket connection timed out')), 4000);
+      roomVisitorSocket.on('connect', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      roomVisitorSocket.on('connect_error', reject);
+    });
+
+    let visitorRevokedReceived = false;
+    roomVisitorSocket.on('error:session_revoked', () => {
+      visitorRevokedReceived = true;
+    });
+
+    // Invoke distributed room disconnection
+    disconnectVisitorSockets(roomTokenHash);
+    await new Promise((r) => setTimeout(r, 200));
+
+    assert.strictEqual(roomVisitorSocket.connected, false, 'Socket must be disconnected via room disconnection');
+    assert.ok(visitorRevokedReceived, 'Must receive error:session_revoked event');
+    console.log('   ✅ PASS: Distributed room disconnection terminated visitor socket');
+
+    // Test 39: WebSocket room-based distributed disconnection for agent user
+    console.log('39. Testing: WebSocket room-based distributed disconnection for agent user...');
+    const agentSocket = ClientIO(`http://localhost:${TEST_PORT}`, {
+      transports: ['websocket'],
+      auth: { token: tokenA },
+      reconnection: false,
+    });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Agent socket connection timed out')), 4000);
+      agentSocket.on('connect', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      agentSocket.on('connect_error', reject);
+    });
+
+    let agentDeactivatedReceived = false;
+    agentSocket.on('error:account_deactivated', () => {
+      agentDeactivatedReceived = true;
+    });
+
+    // Invoke distributed user disconnection
+    disconnectUserSockets(loginA.data.user.id);
+    await new Promise((r) => setTimeout(r, 200));
+
+    assert.strictEqual(agentSocket.connected, false, 'Agent socket must be disconnected via room disconnection');
+    assert.ok(agentDeactivatedReceived, 'Must receive error:account_deactivated event');
+    console.log('   ✅ PASS: Distributed room disconnection terminated agent user socket');
+
+    // Test 40: Legacy SHA-256 password hash migration on login
+    console.log('40. Testing: Legacy SHA-256 password hash migration dynamically upgrades to bcrypt...');
+    const migratedPass = 'LegacyPass123!';
+    const migratedSha256Hash = crypto.createHash('sha256').update(migratedPass + 'supportos_salt_2026').digest('hex');
+    const migratedUserEmail = `legacy_user_${Date.now()}@acme.com`;
+    const migratedUser = await prisma.user.create({
+      data: {
+        organizationId: convA.organizationId,
+        email: migratedUserEmail,
+        passwordHash: migratedSha256Hash,
+        firstName: 'Legacy',
+        lastName: 'User',
+        role: 'AGENT',
+        status: 'ACTIVE',
+      },
+    });
+    createdUserIds.push(migratedUser.id);
+
+    // Initial state: legacy SHA-256
+    assert.strictEqual(migratedUser.passwordHash.startsWith('$2b$'), false);
+
+    // Login with correct password
+    const legacyLoginRes = await request({
+      method: 'POST',
+      path: '/api/v1/auth/login',
+      body: { email: migratedUserEmail, password: migratedPass },
+    });
+    assert.strictEqual(legacyLoginRes.status, 200, 'Legacy user login must succeed');
+
+    // Verify passwordHash in database is now upgraded to bcrypt ($2b$)
+    const migratedUpgradedUser = await prisma.user.findUnique({ where: { id: migratedUser.id } });
+    assert.ok(migratedUpgradedUser?.passwordHash.startsWith('$2b$'), 'Password hash must be upgraded to bcrypt in database');
+    console.log('   ✅ PASS: Legacy SHA-256 user authenticated & password hash dynamically upgraded to bcrypt');
+
+    // Test 41: Upgraded account logs in with modern bcrypt verification on second login
+    console.log('41. Testing: Upgraded user logs in with modern bcrypt verification on second login...');
+    const secondLoginRes = await request({
+      method: 'POST',
+      path: '/api/v1/auth/login',
+      body: { email: migratedUserEmail, password: migratedPass },
+    });
+    assert.strictEqual(secondLoginRes.status, 200, 'Upgraded user second login must succeed via bcrypt');
+    console.log('   ✅ PASS: Upgraded user logs in via bcrypt successfully');
+
+    // Test 42: Legacy account rejects invalid password and does NOT upgrade
+    console.log('42. Testing: Legacy account rejects invalid password and does NOT upgrade...');
+    const migratedUser2Email = `legacy_user2_${Date.now()}@acme.com`;
+    const migratedUser2 = await prisma.user.create({
+      data: {
+        organizationId: convA.organizationId,
+        email: migratedUser2Email,
+        passwordHash: migratedSha256Hash,
+        firstName: 'Legacy2',
+        lastName: 'User2',
+        role: 'AGENT',
+        status: 'ACTIVE',
+      },
+    });
+    createdUserIds.push(migratedUser2.id);
+
+    const badLoginRes = await request({
+      method: 'POST',
+      path: '/api/v1/auth/login',
+      body: { email: migratedUser2Email, password: 'WrongPassword123!' },
+    });
+    assert.strictEqual(badLoginRes.status, 401, 'Invalid password must return 401');
+    const user2AfterBadLogin = await prisma.user.findUnique({ where: { id: migratedUser2.id } });
+    assert.strictEqual(user2AfterBadLogin?.passwordHash, migratedSha256Hash, 'Password hash must NOT be upgraded on failed attempt');
+    console.log('   ✅ PASS: Invalid password for legacy account rejected with 401 and hash remains unchanged');
+
+    // Test 43: Production config validation fails if REQUIRE_REDIS=true but REDIS_URL missing
+    console.log('43. Testing: Production config validation rejects missing REDIS_URL when REQUIRE_REDIS=true...');
+    assert.throws(
+      () => {
+        validateSecurityConfig({
+          nodeEnv: 'production',
+          jwtSecret: 'a'.repeat(35),
+          billingWebhookSecret: 'b'.repeat(35),
+          requireRedis: true,
+          redisUrl: null,
+          corsOrigins: ['https://app.supportos.io'],
+        } as any);
+      },
+      /REQUIRE_REDIS=true is set in production, but REDIS_URL is not configured/
+    );
+    console.log('   ✅ PASS: Startup validation rejects missing REDIS_URL in production');
+
+    // Test 44: Production config validation fails if CORS_ORIGIN contains wildcard '*'
+    console.log('44. Testing: Production config validation rejects wildcard "*" in CORS_ORIGIN...');
+    assert.throws(
+      () => {
+        validateSecurityConfig({
+          nodeEnv: 'production',
+          jwtSecret: 'a'.repeat(35),
+          billingWebhookSecret: 'b'.repeat(35),
+          requireRedis: false,
+          redisUrl: null,
+          corsOrigins: ['*'],
+        } as any);
+      },
+      /CORS_ORIGIN cannot contain wildcard "\*"/
+    );
+    console.log('   ✅ PASS: Startup validation rejects wildcard "*" in production CORS_ORIGIN');
+
+    // Test 45: Rate limiter middleware unexpected error fails closed with 503 when requireRedis/production
+    console.log('45. Testing: Rate limiter middleware fails closed on unexpected error when requireRedis is active...');
+    config.requireRedis = true;
+    const brokenReq = {
+      headers: {},
+      socket: {
+        get remoteAddress(): string {
+          throw new Error('Unexpected physical socket descriptor read error');
+        },
+      },
+    } as any;
+    let service503Returned = false;
+    const brokenLimiter = rateLimiter({ windowMs: 1000, max: 10 });
+    const brokenRes = {
+      setHeader: () => {},
+      status: (code: number) => {
+        if (code === 503) service503Returned = true;
+        return { json: () => {} };
+      },
+    } as any;
+    await brokenLimiter(brokenReq, brokenRes, () => {});
+    assert.strictEqual(service503Returned, true, 'Unexpected rate limiter error must fail closed with 503');
+    config.requireRedis = false;
+    console.log('   ✅ PASS: Rate limiter fails closed with 503 on unexpected middleware errors');
+
     console.log('\n================================================================');
-    console.log('🏆 ALL 37 RIGOROUS SECURITY & RECOVERY TEST CASES PASSED!');
+    console.log('🏆 ALL 45 RIGOROUS SECURITY & RECOVERY TEST CASES PASSED!');
     console.log('================================================================');
   } finally {
     // Isolated test data cleanup
@@ -1120,7 +1348,9 @@ async function runSecurityRemediationSuite() {
       await prisma.refreshToken.deleteMany({ where: { userId: { in: createdUserIds } } }).catch(() => {});
       await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } }).catch(() => {});
     }
-    await prisma.webhookEvent.deleteMany({}).catch(() => {});
+    if (createdWebhookEventIds.length > 0) {
+      await prisma.webhookEvent.deleteMany({ where: { eventId: { in: createdWebhookEventIds } } }).catch(() => {});
+    }
 
     // Reliable server & connection teardown
     await new Promise<void>((resolve) => server.close(() => resolve()));

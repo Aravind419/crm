@@ -12,11 +12,11 @@ concurrency:
 
 jobs:
   ci:
-    name: Build, Lint & Security Test Verification
+    name: Build, Lint & Security Test Verification (SQLite)
     runs-on: ubuntu-latest
 
     env:
-      NODE_ENV: development
+      NODE_ENV: test
       PORT: 4000
       JWT_SECRET: supportos_ci_test_secret_key_random_long_string_2026
       BILLING_WEBHOOK_SECRET: supportos_ci_billing_secret_key_random_long_string_2026
@@ -34,6 +34,9 @@ jobs:
 
       - name: Install Workspace Dependencies
         run: npm install
+
+      - name: Workspace Dependency Security Audit
+        run: npm run audit:check
 
       - name: Setup & Migrate Database
         run: |
@@ -57,3 +60,78 @@ jobs:
         env:
           NODE_ENV: production
         run: npm --prefix apps/web run build
+
+  postgres-rls-verification:
+    name: PostgreSQL Production Schema & RLS Verification
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: supportos_prod_test
+          POSTGRES_USER: supportos_user
+          POSTGRES_PASSWORD: supportos_ci_secure_password_2026
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      PORT: 4001
+      JWT_SECRET: supportos_ci_test_secret_key_random_long_string_2026
+      BILLING_WEBHOOK_SECRET: supportos_ci_billing_secret_key_random_long_string_2026
+      DATABASE_URL: "postgresql://supportos_user:supportos_ci_secure_password_2026@localhost:5432/supportos_prod_test?schema=public"
+      REDIS_URL: "redis://localhost:6379"
+      REQUIRE_REDIS: "true"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js v20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Workspace Dependencies
+        run: npm install
+
+      - name: Setup PostgreSQL Schema & Database Push
+        run: |
+          npx prisma generate --schema=prisma/schema.postgresql.prisma
+          npx prisma db push --schema=prisma/schema.postgresql.prisma
+
+      - name: Apply PostgreSQL Row-Level Security (RLS) Policies
+        run: |
+          PGPASSWORD=supportos_ci_secure_password_2026 psql -h localhost -U supportos_user -d supportos_prod_test -f prisma/rls_policies.sql
+
+      - name: Seed PostgreSQL Database
+        run: npx tsx prisma/seed.ts
+
+      - name: Run Native PostgreSQL RLS Isolation Tests
+        run: npm --prefix apps/api run test:postgres-rls
+
+      - name: Run Multi-Tenant Isolation Tests against PostgreSQL
+        run: npm --prefix apps/api run test:security
+
+      - name: Run Core API Tests against PostgreSQL
+        run: npm --prefix apps/api test
+
+      - name: Compile Backend TypeScript Build against PostgreSQL Schema
+        run: npm --prefix apps/api run build

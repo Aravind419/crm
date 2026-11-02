@@ -85,8 +85,13 @@ volumes:
 | :--- | :--- | :--- |
 | `PORT` | API listen port | `4000` |
 | `DATABASE_URL` | PostgreSQL connection string | `postgresql://user:pass@host:5432/supportos?sslmode=require` |
-| `JWT_SECRET` | 256-bit cryptographically secure string | Generated via `openssl rand -hex 32` |
-| `CORS_ORIGIN` | Allowed web origins | `https://app.yourdomain.com` |
+| `JWT_SECRET` | 256-bit cryptographically secure string (>= 32 chars) | Generated via `openssl rand -hex 32` |
+| `BILLING_WEBHOOK_SECRET` | Secret key for billing webhook HMAC-SHA256 verification | Generated via `openssl rand -hex 32` |
+| `CORS_ORIGIN` | Allowed administrative web origins (comma-separated) | `https://app.yourdomain.com` |
+| `ALLOWED_WIDGET_ORIGINS` | Allowed customer embedding origins for public widget | `*` or `https://customer1.com,https://customer2.com` |
+| `REDIS_URL` | Redis instance for rate limiting & WebSocket cluster | `redis://redis:6379` |
+| `REQUIRE_REDIS` | Fail closed (503) if Redis is unavailable | `true` |
+| `TRUST_PROXY` | Trust reverse proxy headers (X-Forwarded-For) | `true` |
 | `NEXT_PUBLIC_API_URL` | Public HTTP API endpoint | `https://api.yourdomain.com` |
 | `NEXT_PUBLIC_SOCKET_URL`| Public WebSocket endpoint | `https://api.yourdomain.com` |
 | `NEXT_PUBLIC_APP_URL` | Public Frontend URL | `https://app.yourdomain.com` |
@@ -96,9 +101,12 @@ volumes:
 ## 4. Database Migrations & Initial Setup
 
 ```bash
-# Run database migrations against target database
+# 1. Run database schema push against target PostgreSQL database
 npx prisma db push --schema=prisma/schema.postgresql.prisma
 
-# Seed master administrative account
-node -r ts-node/register prisma/seed.ts
+# 2. Apply PostgreSQL Row-Level Security (RLS) policies
+psql -h postgres -U supportos_admin -d supportos -f prisma/rls_policies.sql
+
+# 3. Seed initial master organization and administrative accounts
+npx tsx prisma/seed.ts
 ```

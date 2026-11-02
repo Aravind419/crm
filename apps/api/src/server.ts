@@ -45,22 +45,33 @@ app.use((req, res, next) => {
   const isPublicRoute = req.path.startsWith('/api/v1/public') || req.path === '/health';
 
   if (isPublicRoute) {
-    // Public widget endpoints allow customer websites
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    // Public widget endpoints allow customer websites without credentials
+    const isAllowedWidget =
+      config.allowedWidgetOrigins.includes('*') ||
+      (origin && config.allowedWidgetOrigins.includes(origin));
+
+    if (isAllowedWidget && origin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    } else if (config.allowedWidgetOrigins.includes('*')) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-visitor-token');
   } else if (origin) {
     // Protected administrative routes enforce strict allow-list
     const isAllowed =
       config.corsOrigins.includes(origin) ||
-      origin.startsWith('http://localhost') ||
-      origin.startsWith('http://127.0.0.1');
+      (config.nodeEnv !== 'production' &&
+        (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')));
 
     if (isAllowed) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-visitor-token, x-billing-signature');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type, Authorization, x-visitor-token, x-billing-signature, x-billing-timestamp, x-billing-event-id'
+      );
     }
   }
 
@@ -139,6 +150,20 @@ if (require.main === module) {
     console.log(`🚀 SupportOS API Server running on http://localhost:${config.port}`);
     console.log(`⚡ Real-Time Socket.IO Gateway active`);
   });
+
+  const handleShutdown = async (signal: string) => {
+    console.log(`[Server] Received ${signal}. Gracefully terminating HTTP server and background connections...`);
+    server.close(async () => {
+      try {
+        const { closeRedis } = await import('./services/redis.service');
+        await closeRedis();
+      } catch (_) {}
+      process.exit(0);
+    });
+  };
+
+  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+  process.on('SIGINT', () => handleShutdown('SIGINT'));
 }
 
 export { app, server };

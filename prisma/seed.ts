@@ -1,11 +1,12 @@
 import { PrismaClient } from '@prisma/client';
 import * as crypto from 'crypto';
+import bcrypt from 'bcryptjs';
 
 const prisma = new PrismaClient();
 
-// Simple, secure SHA-256 password hash for test/seed consistency
+// Secure bcrypt password hash for seed consistency ($2b$)
 function hashPassword(password: string): string {
-  return crypto.createHash('sha256').update(password + 'supportos_salt_2026').digest('hex');
+  return bcrypt.hashSync(password, 10);
 }
 
 async function main() {

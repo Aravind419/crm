@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "test": "ts-node tests/api.test.ts",
     "test:security": "ts-node tests/tenant-isolation.test.ts",
-    "test:remediation": "ts-node tests/security-remediation.test.ts"
+    "test:remediation": "ts-node tests/security-remediation.test.ts",
+    "test:postgres-rls": "tsx tests/postgresql-rls.test.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.4.1",

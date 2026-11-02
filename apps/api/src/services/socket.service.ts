@@ -158,15 +158,19 @@ export function initSocketService(server: HttpServer): SocketIOServer {
   });
 
   io.on('connection', (socket: Socket) => {
-    // Automatically join authorized tenant or thread rooms based on verified identity
+    // Automatically join authorized tenant, user, or thread rooms based on verified identity
     if (socket.data.isAgent && socket.data.organizationId) {
       const orgRoom = `org:${socket.data.organizationId}`;
+      const userRoom = `user:${socket.data.userId}`;
       socket.join(orgRoom);
+      socket.join(userRoom);
     }
 
     if (socket.data.isVisitor && socket.data.conversationId) {
       const convRoom = `conv:${socket.data.conversationId}`;
+      const sessionRoom = `session:${socket.data.tokenHash}`;
       socket.join(convRoom);
+      socket.join(sessionRoom);
     }
 
     // Explicit room join request with authorization enforcement
@@ -294,28 +298,55 @@ export function broadcastToConversation(conversationId: string, event: string, p
 
 /**
  * Immediately severs active WebSocket connections for a revoked visitor session
- * and emits a session revoked error event so client-side state is purged.
+ * across all distributed cluster nodes via room-based disconnection and local socket cleanup.
  */
 export function disconnectVisitorSockets(tokenOrHash: string): void {
   if (!io || !tokenOrHash) return;
   const hash = tokenOrHash.length === 64 ? tokenOrHash : crypto.createHash('sha256').update(tokenOrHash).digest('hex');
+  const sessionRoom = `session:${hash}`;
+
+  try {
+    // Distributed cluster broadcast via Redis adapter / Socket.IO room
+    io.to(sessionRoom).emit('error:session_revoked', { message: 'Visitor session has been revoked' });
+    io.in(sessionRoom).disconnectSockets(true);
+  } catch (err: any) {
+    console.error('[Socket.IO Distributed Disconnect Error]:', err.message);
+  }
+
+  // Defensive local fallback for single-instance or unregistered room states
   for (const [, socket] of io.sockets.sockets) {
     if (socket.data?.isVisitor && (socket.data?.tokenHash === hash || socket.data?.visitorToken === tokenOrHash)) {
-      socket.emit('error:session_revoked', { message: 'Visitor session has been revoked' });
-      socket.disconnect(true);
+      try {
+        socket.emit('error:session_revoked', { message: 'Visitor session has been revoked' });
+        socket.disconnect(true);
+      } catch (_) {}
     }
   }
 }
 
 /**
- * Immediately severs active WebSocket connections for a deactivated or logged-out agent.
+ * Immediately severs active WebSocket connections for a deactivated or logged-out agent
+ * across all distributed cluster nodes via room-based disconnection and local socket cleanup.
  */
 export function disconnectUserSockets(userId: string): void {
   if (!io || !userId) return;
+  const userRoom = `user:${userId}`;
+
+  try {
+    // Distributed cluster broadcast via Redis adapter / Socket.IO room
+    io.to(userRoom).emit('error:account_deactivated', { message: 'Agent account session has been terminated' });
+    io.in(userRoom).disconnectSockets(true);
+  } catch (err: any) {
+    console.error('[Socket.IO Distributed Disconnect Error]:', err.message);
+  }
+
+  // Defensive local fallback for single-instance or unregistered room states
   for (const [, socket] of io.sockets.sockets) {
     if (socket.data?.isAgent && socket.data?.userId === userId) {
-      socket.emit('error:account_deactivated', { message: 'Agent account session has been terminated' });
-      socket.disconnect(true);
+      try {
+        socket.emit('error:account_deactivated', { message: 'Agent account session has been terminated' });
+        socket.disconnect(true);
+      } catch (_) {}
     }
   }
 }

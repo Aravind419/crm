@@ -10,10 +10,10 @@ import { disconnectUserSockets } from '../services/socket.service';
 
 const router = Router();
 
-// Rate limiter for authentication endpoints: max 20 attempts per 60 seconds
+// Rate limiter for authentication endpoints: max 20 attempts per 60 seconds (relaxed in test harness)
 const authRateLimiter = rateLimiter({
   windowMs: 60 * 1000,
-  max: 20,
+  max: config.nodeEnv === 'test' ? 100 : 20,
   message: 'Too many authentication attempts. Please wait 1 minute before trying again.',
 });
 
@@ -38,9 +38,18 @@ export async function verifyPassword(password: string, hash: string): Promise<bo
   if (hash.startsWith('$2a$') || hash.startsWith('$2b$')) {
     return bcrypt.compare(password, hash);
   }
-  // Fallback for legacy seeded hashes
-  const legacyHash = crypto.createHash('sha256').update(password + 'supportos_salt_2026').digest('hex');
-  return legacyHash === hash;
+  // Timing-safe fallback for legacy SHA-256 hashes during migration window
+  try {
+    const legacyHash = crypto.createHash('sha256').update(password + 'supportos_salt_2026').digest('hex');
+    const legacyBuf = Buffer.from(legacyHash, 'utf8');
+    const hashBuf = Buffer.from(hash, 'utf8');
+    if (legacyBuf.length !== hashBuf.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(legacyBuf, hashBuf);
+  } catch {
+    return false;
+  }
 }
 
 export async function createRefreshToken(userId: string, familyId?: string): Promise<string> {
