@@ -5,6 +5,7 @@ import * as crypto from 'crypto';
 import { app, server } from '../src/server';
 import { prisma } from '../src/prisma';
 import { config } from '../src/config';
+import { EmailService, escapeHtml } from '../src/services/email.service';
 
 const TEST_PORT = 4995;
 
@@ -685,7 +686,284 @@ async function runOnboardingAdministrationSuite() {
     assert.strictEqual(crossDeleteRes.status, 404, 'Cross-tenant team deletion must return 404');
     console.log('   ✅ Cross-tenant boundaries strictly enforced across teams, users, and organization settings');
 
-    console.log('\n🎉 ALL PHASE 1 ONBOARDING & ADMINISTRATION TESTS PASSED SUCCESSFULLY!');
+    // ------------------------------------------------------------------------
+    // Scenario 17: Concurrent Invitation Acceptance (Atomic Single-Consumer)
+    // ------------------------------------------------------------------------
+    console.log('\n17. Testing Concurrent Invitation Acceptance (Atomic Single-Consumer)...');
+    const raceEmail = `race.agent.${orgSuffix}@zenithcloud.test`;
+    const raceInviteRes = await request({
+      method: 'POST',
+      path: '/api/v1/users/invite',
+      headers: ownerHeaders,
+      body: {
+        email: raceEmail,
+        role: 'AGENT',
+      },
+    });
+    assert.strictEqual(raceInviteRes.status, 201);
+    const raceToken = raceInviteRes.data.invitationUrl.split('/invite/')[1];
+
+    // Fire 3 simultaneous acceptance requests
+    const raceResults = await Promise.all([
+      request({
+        method: 'POST',
+        path: '/api/v1/auth/invitations/accept',
+        body: { token: raceToken, firstName: 'Race1', lastName: 'Agent', password: 'RacePassword123!Secure' },
+      }),
+      request({
+        method: 'POST',
+        path: '/api/v1/auth/invitations/accept',
+        body: { token: raceToken, firstName: 'Race2', lastName: 'Agent', password: 'RacePassword123!Secure' },
+      }),
+      request({
+        method: 'POST',
+        path: '/api/v1/auth/invitations/accept',
+        body: { token: raceToken, firstName: 'Race3', lastName: 'Agent', password: 'RacePassword123!Secure' },
+      }),
+    ]);
+
+    const successfulAccepts = raceResults.filter((r) => r.status === 200);
+    const rejectedAccepts = raceResults.filter((r) => r.status === 409 || r.status === 400 || r.status === 404);
+
+    assert.strictEqual(successfulAccepts.length, 1, `Exactly ONE concurrent acceptance must succeed, got ${successfulAccepts.length}`);
+    assert.strictEqual(rejectedAccepts.length, 2, `Other concurrent acceptance requests must fail, got ${rejectedAccepts.length}`);
+
+    // Verify user in DB is ACTIVE and invitationTokenHash is null
+    const raceUserInDb = await prisma.user.findFirst({
+      where: { email: raceEmail },
+    });
+    assert.strictEqual(raceUserInDb?.status, 'ACTIVE');
+    assert.strictEqual(raceUserInDb?.invitationTokenHash, null);
+    console.log('   ✅ Concurrency verified: exactly 1 request consumed the token, 2 were rejected atomically');
+
+    // ------------------------------------------------------------------------
+    // Scenario 18: Regression Defense — Removal of initialPassword Bypass
+    // ------------------------------------------------------------------------
+    console.log('\n18. Testing Removal of initialPassword Bypass...');
+    const bypassEmail = `bypass.agent.${orgSuffix}@zenithcloud.test`;
+    const bypassRes = await request({
+      method: 'POST',
+      path: '/api/v1/users/invite',
+      headers: ownerHeaders,
+      body: {
+        email: bypassEmail,
+        firstName: 'Hacker',
+        lastName: 'Bypass',
+        role: 'AGENT',
+        initialPassword: 'InsecureBypass123!Password', // Attempt bypass
+      },
+    });
+    assert.strictEqual(bypassRes.status, 201);
+    assert.strictEqual(bypassRes.data.user.status, 'INVITED', 'Invited user must remain INVITED even if initialPassword was supplied');
+
+    const bypassUserDb = await prisma.user.findFirst({
+      where: { email: bypassEmail },
+    });
+    assert.strictEqual(bypassUserDb?.status, 'INVITED');
+    assert.ok(bypassUserDb?.passwordHash.startsWith('UNSET_INVITATION_'), 'Password hash must be unmatchable random token');
+
+    // Attempt login with supplied initialPassword -> MUST FAIL
+    const loginBypassRes = await request({
+      method: 'POST',
+      path: '/api/v1/auth/login',
+      body: {
+        email: bypassEmail,
+        password: 'InsecureBypass123!Password',
+      },
+    });
+    assert.ok(
+      [401, 403].includes(loginBypassRes.status),
+      `Login attempt with initialPassword must be rejected, got ${loginBypassRes.status}`
+    );
+    console.log('   ✅ initialPassword bypass neutralized: account remains INVITED with unmatchable hash');
+
+    // ------------------------------------------------------------------------
+    // Scenario 19: Secure Invitation Email Rendering & HTML Escaping
+    // ------------------------------------------------------------------------
+    console.log('\n19. Testing Secure Invitation Email Rendering & HTML Escaping...');
+    const maliciousParams = {
+      to: 'target@example.com',
+      recipientName: '<script>alert("xss")</script>Bob',
+      inviterName: 'Alice "Admin" <img src=x onerror=alert(1)>',
+      organizationName: 'Acme Corp & Partners <evil>',
+      role: 'AGENT <b>bold</b>',
+      invitationUrl: `${config.appUrl}/invite/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2`,
+      expiresAt: new Date(),
+    };
+
+    const renderedHtml = EmailService.renderInvitationHtml(maliciousParams);
+    assert.ok(!renderedHtml.includes('<script>'), 'Rendered email must not contain unescaped <script>');
+    assert.ok(!renderedHtml.includes('<img'), 'Rendered email must not contain unescaped <img>');
+    assert.ok(!renderedHtml.includes('<evil>'), 'Rendered email must not contain unescaped <evil>');
+    assert.ok(!renderedHtml.includes('<b>bold</b>'), 'Rendered email must not contain unescaped <b>');
+    assert.ok(renderedHtml.includes('&lt;script&gt;'), 'Rendered email must escape <script> to &lt;script&gt;');
+    assert.ok(renderedHtml.includes('&amp; Partners'), 'Rendered email must escape & to &amp;');
+
+    // Test invitation URL origin validation
+    const badUrlDelivery = await EmailService.sendInvitation({
+      ...maliciousParams,
+      invitationUrl: 'https://evil-phishing-site.com/invite/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+    });
+    assert.strictEqual(badUrlDelivery.delivered, false);
+    assert.strictEqual(badUrlDelivery.status, 'FAILED');
+    assert.ok(badUrlDelivery.error?.includes('Invalid invitation URL origin'));
+    console.log('   ✅ HTML injection neutralized with escaping; untrusted invitation URL origins strictly rejected');
+
+    // ------------------------------------------------------------------------
+    // Scenario 20: Strict Onboarding Validation Category Tests
+    // ------------------------------------------------------------------------
+    console.log('\n20. Testing Strict Onboarding & Settings Validation Categories...');
+
+    // A. Step range validation
+    const badStepLow = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/onboarding',
+      headers: ownerHeaders,
+      body: { step: 0 },
+    });
+    assert.strictEqual(badStepLow.status, 400);
+
+    const badStepHigh = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/onboarding',
+      headers: ownerHeaders,
+      body: { step: 99 },
+    });
+    assert.strictEqual(badStepHigh.status, 400);
+
+    // B. Timezone validation
+    const badTzRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: { timezone: 'Mars/Phobos' },
+    });
+    assert.strictEqual(badTzRes.status, 400);
+    assert.ok(badTzRes.data.message.includes('timezone'));
+
+    // C. Locale validation
+    const badLocaleRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: { locale: '123_invalid_locale' },
+    });
+    assert.strictEqual(badLocaleRes.status, 400);
+
+    // D. Brand color validation
+    const badColorRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: { brandColor: '#GGG123' },
+    });
+    assert.strictEqual(badColorRes.status, 400);
+
+    // E. Logo URL validation
+    const badLogoRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: { logoUrl: 'javascript:alert(1)' },
+    });
+    assert.strictEqual(badLogoRes.status, 400);
+
+    // F. Allowed domains wildcard rejection
+    const badDomainRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: { allowedDomains: ['*'] },
+    });
+    assert.strictEqual(badDomainRes.status, 400);
+
+    // G. Business hours validation: invalid day
+    const badDayRes = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: {
+        businessHours: {
+          timezone: 'UTC',
+          schedule: {
+            funday: { enabled: true, start: '09:00', end: '17:00' },
+          },
+        },
+      },
+    });
+    assert.strictEqual(badDayRes.status, 400);
+
+    // H. Business hours validation: inverted start and end time
+    const badHoursInverted = await request({
+      method: 'PATCH',
+      path: '/api/v1/organizations/current',
+      headers: ownerHeaders,
+      body: {
+        businessHours: {
+          timezone: 'UTC',
+          schedule: {
+            monday: { enabled: true, start: '18:00', end: '09:00' },
+          },
+        },
+      },
+    });
+    assert.strictEqual(badHoursInverted.status, 400);
+    assert.ok(badHoursInverted.data.message.includes('precede'));
+
+    // I. Premature onboarding completion rejection without required fields
+    const emptyOrgSignup = await request({
+      method: 'POST',
+      path: '/api/v1/auth/signup',
+      body: {
+        orgName: `Incomplete Org ${orgSuffix}`,
+        firstName: 'Incomplete',
+        lastName: 'Owner',
+        email: `incomplete.${orgSuffix}@test.com`,
+        password: 'Password123!Secure',
+      },
+    });
+    const emptyOrgHeaders = { Authorization: `Bearer ${emptyOrgSignup.data.token}` };
+    createdOrgIds.push(emptyOrgSignup.data.organization.id);
+
+    const prematureComplete = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/onboarding',
+      headers: emptyOrgHeaders,
+      body: {
+        completed: true,
+        companyName: '', // Empty!
+      },
+    });
+    assert.strictEqual(prematureComplete.status, 400, 'Premature completion with missing fields must fail with 400');
+    console.log('   ✅ Strict validation verified across step ranges, timezones, locales, colors, URLs, domains, and schedules');
+
+    // ------------------------------------------------------------------------
+    // Scenario 21: Concurrent Duplicate Invitation Creation Safety
+    // ------------------------------------------------------------------------
+    console.log('\n21. Testing Concurrent Duplicate Invitation Creation Safety...');
+    const dupInviteEmail = `concurrent.dup.${orgSuffix}@zenithcloud.test`;
+    const [dupRes1, dupRes2] = await Promise.all([
+      request({
+        method: 'POST',
+        path: '/api/v1/users/invite',
+        headers: ownerHeaders,
+        body: { email: dupInviteEmail, role: 'AGENT' },
+      }),
+      request({
+        method: 'POST',
+        path: '/api/v1/users/invite',
+        headers: ownerHeaders,
+        body: { email: dupInviteEmail, role: 'AGENT' },
+      }),
+    ]);
+
+    const createdDups = [dupRes1, dupRes2].filter((r) => r.status === 201);
+    const conflictDups = [dupRes1, dupRes2].filter((r) => r.status === 409);
+    assert.strictEqual(createdDups.length, 1, `Exactly one duplicate invite must succeed, got ${createdDups.length}`);
+    assert.strictEqual(conflictDups.length, 1, `Second duplicate invite must receive 409 Conflict, got ${conflictDups.length}`);
+    console.log('   ✅ Concurrent duplicate invites safely handled: 1 created (201), 1 conflict (409), 0 unhandled 500s');
+
+    console.log('\n🎉 ALL PHASE 1 & PHASE 1.1 ONBOARDING & ADMINISTRATION TESTS PASSED SUCCESSFULLY!');
   } finally {
     try {
       const { closeSocketService } = await import('../src/services/socket.service');

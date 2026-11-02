@@ -6,6 +6,14 @@ import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
 import { tenantIsolationGuard } from '../middleware/tenant';
 import { requireRoles } from '../middleware/roles';
 import { EntitlementService } from '../services/entitlement.service';
+import {
+  isValidTimezone,
+  isValidLocale,
+  isValidHexColor,
+  isValidLogoUrl,
+  validateAllowedDomains,
+  validateBusinessHours,
+} from '../utils/validation';
 
 const router = Router();
 
@@ -235,6 +243,7 @@ router.get('/current', async (req: AuthenticatedRequest, res: Response): Promise
  * PATCH /api/v1/organizations/current
  * ANTI-TAMPERING DEFENSE: Plan modification is strictly rejected here.
  * Allows updating: name, logoUrl, brandColor, timezone, locale, businessHours, allowedDomains.
+ * Enforces strict validation on all fields.
  */
 router.patch('/current', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
@@ -249,14 +258,69 @@ router.patch('/current', requireRoles(['OWNER', 'ADMIN']), async (req: Authentic
       return;
     }
 
-    if (name !== undefined && (!name || !String(name).trim())) {
-      res.status(400).json({ error: 'Bad Request', message: 'Organization name cannot be empty' });
-      return;
+    if (name !== undefined) {
+      if (typeof name !== 'string' || !name.trim()) {
+        res.status(400).json({ error: 'Bad Request', message: 'Organization name cannot be empty' });
+        return;
+      }
+      if (name.trim().length > 100) {
+        res.status(400).json({ error: 'Bad Request', message: 'Organization name cannot exceed 100 characters' });
+        return;
+      }
     }
 
-    if (brandColor !== undefined && !/^#[0-9A-Fa-f]{6}$/.test(String(brandColor).trim())) {
-      res.status(400).json({ error: 'Bad Request', message: 'Brand color must be a valid 6-character hex color (e.g. #2563EB)' });
-      return;
+    if (logoUrl !== undefined && logoUrl !== null && logoUrl !== '') {
+      if (!isValidLogoUrl(logoUrl)) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'Invalid logo URL: must be a valid http or https URL with valid hostname and no credentials',
+        });
+        return;
+      }
+    }
+
+    if (brandColor !== undefined) {
+      if (!isValidHexColor(brandColor)) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'Brand color must be a valid 6-character hex color (e.g. #2563EB)',
+        });
+        return;
+      }
+    }
+
+    if (timezone !== undefined) {
+      if (!isValidTimezone(timezone)) {
+        res.status(400).json({ error: 'Bad Request', message: `Invalid IANA timezone identifier: ${timezone}` });
+        return;
+      }
+    }
+
+    if (locale !== undefined) {
+      if (!isValidLocale(locale)) {
+        res.status(400).json({ error: 'Bad Request', message: `Invalid BCP 47 locale format: ${locale}` });
+        return;
+      }
+    }
+
+    let validatedHoursJson: string | undefined = undefined;
+    if (businessHours !== undefined && businessHours !== null) {
+      const bhResult = validateBusinessHours(businessHours);
+      if (!bhResult.valid) {
+        res.status(400).json({ error: 'Bad Request', message: bhResult.error });
+        return;
+      }
+      validatedHoursJson = JSON.stringify(bhResult.data);
+    }
+
+    let validatedDomainsJson: string | undefined = undefined;
+    if (allowedDomains !== undefined && allowedDomains !== null) {
+      const domResult = validateAllowedDomains(allowedDomains);
+      if (!domResult.valid) {
+        res.status(400).json({ error: 'Bad Request', message: domResult.error });
+        return;
+      }
+      validatedDomainsJson = JSON.stringify(domResult.domains);
     }
 
     const updated = await prisma.$transaction(async (tx) => {
@@ -268,12 +332,8 @@ router.patch('/current', requireRoles(['OWNER', 'ADMIN']), async (req: Authentic
           ...(brandColor !== undefined ? { brandColor: String(brandColor).trim() } : {}),
           ...(timezone !== undefined ? { timezone: String(timezone).trim() } : {}),
           ...(locale !== undefined ? { locale: String(locale).trim() } : {}),
-          ...(businessHours !== undefined
-            ? { businessHours: typeof businessHours === 'object' ? JSON.stringify(businessHours) : String(businessHours) }
-            : {}),
-          ...(allowedDomains !== undefined
-            ? { allowedDomains: typeof allowedDomains === 'object' ? JSON.stringify(allowedDomains) : String(allowedDomains) }
-            : {}),
+          ...(validatedHoursJson !== undefined ? { businessHours: validatedHoursJson } : {}),
+          ...(validatedDomainsJson !== undefined ? { allowedDomains: validatedDomainsJson } : {}),
         },
       });
 
@@ -301,6 +361,7 @@ router.patch('/current', requireRoles(['OWNER', 'ADMIN']), async (req: Authentic
 /**
  * POST /api/v1/organizations/onboarding
  * Step through and complete first-time onboarding wizard.
+ * Strictly validates all input parameters and requirements prior to completion.
  */
 router.post('/onboarding', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
@@ -321,6 +382,159 @@ router.post('/onboarding', requireRoles(['OWNER', 'ADMIN']), async (req: Authent
 
     const organizationId = req.organizationId!;
 
+    // 1. Validate step if provided
+    let stepNum: number | undefined = undefined;
+    if (step !== undefined && step !== null) {
+      stepNum = parseInt(String(step), 10);
+      if (isNaN(stepNum) || stepNum < 1 || stepNum > 5) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'Onboarding step must be an integer between 1 and 5',
+        });
+        return;
+      }
+    }
+
+    // 2. Validate individual fields if provided
+    if (companyName !== undefined && companyName !== null) {
+      if (typeof companyName !== 'string' || !companyName.trim()) {
+        res.status(400).json({ error: 'Bad Request', message: 'Company name cannot be empty' });
+        return;
+      }
+      if (companyName.trim().length > 100) {
+        res.status(400).json({ error: 'Bad Request', message: 'Company name cannot exceed 100 characters' });
+        return;
+      }
+    }
+
+    if (logoUrl !== undefined && logoUrl !== null && logoUrl !== '') {
+      if (!isValidLogoUrl(logoUrl)) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'Invalid logo URL: must be a valid http or https URL with valid hostname',
+        });
+        return;
+      }
+    }
+
+    if (brandColor !== undefined && brandColor !== null) {
+      if (!isValidHexColor(brandColor)) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'Brand color must be a valid 6-character hex color (e.g. #2563EB)',
+        });
+        return;
+      }
+    }
+
+    if (widgetColor !== undefined && widgetColor !== null) {
+      if (!isValidHexColor(widgetColor)) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'Widget color must be a valid 6-character hex color (e.g. #2563EB)',
+        });
+        return;
+      }
+    }
+
+    if (timezone !== undefined && timezone !== null) {
+      if (!isValidTimezone(timezone)) {
+        res.status(400).json({ error: 'Bad Request', message: `Invalid IANA timezone identifier: ${timezone}` });
+        return;
+      }
+    }
+
+    if (locale !== undefined && locale !== null) {
+      if (!isValidLocale(locale)) {
+        res.status(400).json({ error: 'Bad Request', message: `Invalid BCP 47 locale format: ${locale}` });
+        return;
+      }
+    }
+
+    let validatedHoursJson: string | undefined = undefined;
+    if (businessHours !== undefined && businessHours !== null) {
+      const bhResult = validateBusinessHours(businessHours);
+      if (!bhResult.valid) {
+        res.status(400).json({ error: 'Bad Request', message: bhResult.error });
+        return;
+      }
+      validatedHoursJson = JSON.stringify(bhResult.data);
+    }
+
+    let validatedDomainsJson: string | undefined = undefined;
+    if (allowedDomains !== undefined && allowedDomains !== null) {
+      const domResult = validateAllowedDomains(allowedDomains);
+      if (!domResult.valid) {
+        res.status(400).json({ error: 'Bad Request', message: domResult.error });
+        return;
+      }
+      validatedDomainsJson = JSON.stringify(domResult.domains);
+    }
+
+    if (workspaceName !== undefined && workspaceName !== null) {
+      if (typeof workspaceName !== 'string' || !workspaceName.trim()) {
+        res.status(400).json({ error: 'Bad Request', message: 'Workspace name cannot be empty' });
+        return;
+      }
+      if (workspaceName.trim().length > 100) {
+        res.status(400).json({ error: 'Bad Request', message: 'Workspace name cannot exceed 100 characters' });
+        return;
+      }
+    }
+
+    if (inboxGreeting !== undefined && inboxGreeting !== null) {
+      if (typeof inboxGreeting !== 'string' || !inboxGreeting.trim()) {
+        res.status(400).json({ error: 'Bad Request', message: 'Inbox greeting cannot be empty' });
+        return;
+      }
+      if (inboxGreeting.trim().length > 500) {
+        res.status(400).json({ error: 'Bad Request', message: 'Inbox greeting cannot exceed 500 characters' });
+        return;
+      }
+    }
+
+    // 3. Strict completion validation: check mandatory requirements before allowing completion
+    const currentOrg = await prisma.organization.findUnique({
+      where: { id: organizationId },
+      include: {
+        workspaces: { orderBy: { createdAt: 'asc' }, take: 1 },
+        inboxes: { orderBy: { createdAt: 'asc' }, take: 1 },
+      },
+    });
+
+    if (!currentOrg) {
+      res.status(404).json({ error: 'Not Found', message: 'Organization not found' });
+      return;
+    }
+
+    if (completed === true) {
+      const effectiveName = companyName ? String(companyName).trim() : currentOrg.name;
+      const effectiveBrandColor = brandColor ? String(brandColor).trim() : currentOrg.brandColor;
+      const effectiveTimezone = timezone ? String(timezone).trim() : currentOrg.timezone;
+      const effectiveLocale = locale ? String(locale).trim() : currentOrg.locale;
+      const effectiveHours = validatedHoursJson ? JSON.parse(validatedHoursJson) : (currentOrg.businessHours ? JSON.parse(currentOrg.businessHours) : null);
+      const effectiveWorkspace = workspaceName ? String(workspaceName).trim() : (currentOrg.workspaces[0]?.name || null);
+      const effectiveGreeting = inboxGreeting ? String(inboxGreeting).trim() : (currentOrg.inboxes[0]?.greeting || null);
+
+      const missingFields: string[] = [];
+      if (!effectiveName) missingFields.push('companyName');
+      if (!effectiveBrandColor || !isValidHexColor(effectiveBrandColor)) missingFields.push('brandColor');
+      if (!effectiveTimezone || !isValidTimezone(effectiveTimezone)) missingFields.push('timezone');
+      if (!effectiveLocale || !isValidLocale(effectiveLocale)) missingFields.push('locale');
+      if (!effectiveHours || !effectiveHours.schedule) missingFields.push('businessHours');
+      if (!effectiveWorkspace) missingFields.push('workspaceName');
+      if (!effectiveGreeting) missingFields.push('inboxGreeting');
+
+      if (missingFields.length > 0) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: `Cannot complete onboarding: mandatory setup requirements are missing or invalid: ${missingFields.join(', ')}`,
+          missingFields,
+        });
+        return;
+      }
+    }
+
     const result = await prisma.$transaction(async (tx) => {
       // 1. Update organization profile
       const updatedOrg = await tx.organization.update({
@@ -331,9 +545,9 @@ router.post('/onboarding', requireRoles(['OWNER', 'ADMIN']), async (req: Authent
           ...(brandColor ? { brandColor: String(brandColor).trim() } : {}),
           ...(timezone ? { timezone: String(timezone).trim() } : {}),
           ...(locale ? { locale: String(locale).trim() } : {}),
-          ...(businessHours ? { businessHours: typeof businessHours === 'object' ? JSON.stringify(businessHours) : String(businessHours) } : {}),
-          ...(allowedDomains ? { allowedDomains: typeof allowedDomains === 'object' ? JSON.stringify(allowedDomains) : String(allowedDomains) } : {}),
-          ...(step ? { onboardingStep: parseInt(step, 10) } : {}),
+          ...(validatedHoursJson !== undefined ? { businessHours: validatedHoursJson } : {}),
+          ...(validatedDomainsJson !== undefined ? { allowedDomains: validatedDomainsJson } : {}),
+          ...(stepNum ? { onboardingStep: stepNum } : {}),
           ...(completed === true ? { onboardingCompleted: true } : {}),
         },
       });
@@ -377,7 +591,7 @@ router.post('/onboarding', requireRoles(['OWNER', 'ADMIN']), async (req: Authent
           entityType: 'Organization',
           entityId: organizationId,
           ipAddress: req.ip || req.socket.remoteAddress || null,
-          metadata: JSON.stringify({ step, completed }),
+          metadata: JSON.stringify({ step: stepNum, completed }),
         },
       });
 

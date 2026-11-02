@@ -597,59 +597,80 @@ router.post('/invitations/accept', authRateLimiter, async (req: Request, res: Re
     }
 
     const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-
-    const user = await prisma.user.findUnique({
-      where: { invitationTokenHash: tokenHash },
-      include: {
-        organization: true,
-      },
-    });
-
-    if (!user) {
-      res.status(404).json({ error: 'Not Found', message: 'Invalid or already used invitation token' });
-      return;
-    }
-
-    // Replay attack defense: token cannot be reused
-    if (user.status !== 'INVITED') {
-      res.status(400).json({ error: 'Bad Request', message: 'This invitation has already been accepted' });
-      return;
-    }
-
-    // Expiration check
-    if (!user.invitationExpiresAt || user.invitationExpiresAt < new Date()) {
-      res.status(410).json({ error: 'Gone', message: 'This invitation has expired. Please request a new invitation.' });
-      return;
-    }
-
+    const now = new Date();
     const hashedPassword = await hashPassword(password);
 
-    const updatedUser = await prisma.$transaction(async (tx) => {
-      const u = await tx.user.update({
-        where: { id: user.id },
+    // Atomic transaction: Execute conditional update directly on database
+    const { updatedUser, organization } = await prisma.$transaction(async (tx) => {
+      // Find candidate by token hash first
+      const candidate = await tx.user.findUnique({
+        where: { invitationTokenHash: tokenHash },
+        include: { organization: true },
+      });
+
+      if (!candidate) {
+        const err: any = new Error('Invalid or already used invitation token');
+        err.status = 404;
+        throw err;
+      }
+
+      if (candidate.status !== 'INVITED') {
+        const err: any = new Error('This invitation has already been accepted');
+        err.status = 400;
+        throw err;
+      }
+
+      if (!candidate.invitationExpiresAt || candidate.invitationExpiresAt <= now) {
+        const err: any = new Error('This invitation has expired. Please request a new invitation.');
+        err.status = 410;
+        throw err;
+      }
+
+      // ATOMIC CONDITIONAL CONSUMPTION
+      // Exactly one concurrent transaction can match status='INVITED' and valid tokenHash
+      const updateResult = await tx.user.updateMany({
+        where: {
+          id: candidate.id,
+          invitationTokenHash: tokenHash,
+          status: 'INVITED',
+          invitationExpiresAt: { gt: now },
+        },
         data: {
           passwordHash: hashedPassword,
           status: 'ACTIVE',
-          invitationTokenHash: null, // Single-use! Invalidate token immediately
+          invitationTokenHash: null,
           invitationExpiresAt: null,
           ...(firstName && typeof firstName === 'string' && firstName.trim() ? { firstName: firstName.trim() } : {}),
           ...(lastName && typeof lastName === 'string' && lastName.trim() ? { lastName: lastName.trim() } : {}),
         },
       });
 
+      if (updateResult.count !== 1) {
+        // Race condition: another concurrent request consumed this invitation first
+        const err: any = new Error('This invitation has already been accepted or is currently being processed');
+        err.status = 409;
+        throw err;
+      }
+
+      // Fetch the updated user record
+      const activated = await tx.user.findUniqueOrThrow({
+        where: { id: candidate.id },
+      });
+
+      // Write audit event
       await tx.auditEvent.create({
         data: {
-          organizationId: user.organizationId,
-          userId: user.id,
+          organizationId: candidate.organizationId,
+          userId: candidate.id,
           action: 'INVITATION_ACCEPTED',
           entityType: 'User',
-          entityId: user.id,
+          entityId: candidate.id,
           ipAddress: req.ip || req.socket.remoteAddress || null,
-          metadata: JSON.stringify({ email: user.email, role: user.role }),
+          metadata: JSON.stringify({ email: candidate.email, role: candidate.role }),
         },
       });
 
-      return u;
+      return { updatedUser: activated, organization: candidate.organization };
     });
 
     const jwtToken = jwt.sign(
@@ -678,12 +699,19 @@ router.post('/invitations/accept', authRateLimiter, async (req: Request, res: Re
         status: updatedUser.status,
       },
       organization: {
-        id: user.organization.id,
-        name: user.organization.name,
-        slug: user.organization.slug,
+        id: organization.id,
+        name: organization.name,
+        slug: organization.slug,
       },
     });
   } catch (err: any) {
+    const status = err.status || 500;
+    if (status !== 500) {
+      const errorLabel =
+        status === 400 ? 'Bad Request' : status === 404 ? 'Not Found' : status === 410 ? 'Gone' : 'Conflict';
+      res.status(status).json({ error: errorLabel, message: err.message });
+      return;
+    }
     console.error('[Auth Accept Invitation Error]:', err);
     res.status(500).json({ error: 'Internal Server Error', message: 'Failed to accept invitation' });
   }

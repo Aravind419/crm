@@ -87,7 +87,7 @@ router.patch('/availability', async (req: AuthenticatedRequest, res: Response): 
  */
 router.post('/invite', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const { email, firstName, lastName, role, teamIds, initialPassword } = req.body;
+    const { email, firstName, lastName, role, teamIds } = req.body;
     const organizationId = req.organizationId!;
     const inviter = req.user!;
 
@@ -117,36 +117,6 @@ router.post('/invite', requireRoles(['OWNER', 'ADMIN']), async (req: Authenticat
       return;
     }
 
-    // Entitlement Check: Verify agent seat limit under active subscription plan
-    const agentCheck = await EntitlementService.canAddAgent(organizationId);
-    if (!agentCheck.allowed) {
-      res.status(403).json({
-        error: 'Forbidden',
-        message: `Agent seat limit reached. Your ${agentCheck.plan} plan allows up to ${agentCheck.max} agents. Upgrade your subscription to add more team members.`,
-      });
-      return;
-    }
-
-    const existing = await prisma.user.findFirst({
-      where: {
-        organizationId,
-        email: trimmedEmail,
-      },
-    });
-
-    if (existing) {
-      if (existing.status === 'INVITED') {
-        res.status(409).json({
-          error: 'Conflict',
-          message: 'An invitation is already pending for this email. Use resend invitation instead.',
-          userId: existing.id,
-        });
-        return;
-      }
-      res.status(409).json({ error: 'Conflict', message: 'A user with this email already exists in your organization' });
-      return;
-    }
-
     // Verify teamIds belong to current organization
     if (teamIds && Array.isArray(teamIds) && teamIds.length > 0) {
       const validTeams = await prisma.team.findMany({
@@ -159,38 +129,71 @@ router.post('/invite', requireRoles(['OWNER', 'ADMIN']), async (req: Authenticat
       }
     }
 
-    // Cryptographically secure invitation token handling
+    // Cryptographically secure invitation token handling (256-bit entropy)
     const rawToken = crypto.randomBytes(32).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7-day expiration
 
-    // Unmatchable random password hash when agent must set password via invitation acceptance
-    // No hardcoded default password ever used
+    // Unmatchable random password hash: Account can ONLY be activated upon invitation acceptance
+    // Supplying initialPassword cannot bypass this lifecycle
     const unmatchableHash = `UNSET_INVITATION_${crypto.randomBytes(32).toString('hex')}`;
-    const passwordHash = initialPassword ? await hashPassword(String(initialPassword)) : unmatchableHash;
-    const userStatus = initialPassword ? 'ACTIVE' : 'INVITED';
 
-    const user = await prisma.user.create({
-      data: {
-        organizationId,
-        email: trimmedEmail,
-        passwordHash,
-        firstName: finalFirstName,
-        lastName: finalLastName,
-        role: targetRole as any,
-        status: userStatus,
-        isAvailable: initialPassword ? true : false,
-        invitationTokenHash: initialPassword ? null : tokenHash,
-        invitationExpiresAt: initialPassword ? null : expiresAt,
-        invitedById: inviter.id,
-        ...(teamIds && Array.isArray(teamIds)
-          ? {
-              teamMemberships: {
-                create: teamIds.map((teamId: string) => ({ teamId })),
-              },
-            }
-          : {}),
-      },
+    // Atomic transaction: re-verify seat limit and create user
+    const user = await prisma.$transaction(async (tx) => {
+      // Re-check seat quota inside transaction
+      const currentCount = await tx.user.count({
+        where: { organizationId, status: { in: ['ACTIVE', 'INVITED'] } },
+      });
+
+      const org = await tx.organization.findUnique({
+        where: { id: organizationId },
+        select: { plan: true },
+      });
+      const plan = org?.plan?.toUpperCase() || 'GROWTH';
+      const { limits } = await EntitlementService.getPlanLimits(organizationId);
+
+      if (currentCount >= limits.maxAgents) {
+        const err: any = new Error(`Agent seat limit reached. Your ${plan} plan allows up to ${limits.maxAgents} agents.`);
+        err.status = 403;
+        throw err;
+      }
+
+      // Check existing email in org
+      const existing = await tx.user.findFirst({
+        where: { organizationId, email: trimmedEmail },
+      });
+      if (existing) {
+        const err: any = new Error(
+          existing.status === 'INVITED'
+            ? 'An invitation is already pending for this email. Use resend invitation instead.'
+            : 'A user with this email already exists in your organization'
+        );
+        err.status = 409;
+        throw err;
+      }
+
+      return tx.user.create({
+        data: {
+          organizationId,
+          email: trimmedEmail,
+          passwordHash: unmatchableHash,
+          firstName: finalFirstName,
+          lastName: finalLastName,
+          role: targetRole as any,
+          status: 'INVITED', // STRICT: Always INVITED, never immediately ACTIVE
+          isAvailable: false,
+          invitationTokenHash: tokenHash,
+          invitationExpiresAt: expiresAt,
+          invitedById: inviter.id,
+          ...(teamIds && Array.isArray(teamIds)
+            ? {
+                teamMemberships: {
+                  create: teamIds.map((teamId: string) => ({ teamId })),
+                },
+              }
+            : {}),
+        },
+      });
     });
 
     const org = await prisma.organization.findUnique({
@@ -203,7 +206,7 @@ router.post('/invite', requireRoles(['OWNER', 'ADMIN']), async (req: Authenticat
     // Dispatch real email or report blocked
     const emailResult = await EmailService.sendInvitation({
       to: user.email,
-      recipientName: `${user.firstName} ${user.lastName}`,
+      recipientName: `${user.firstName} ${user.lastName}`.trim(),
       inviterName: `${inviter.email}`,
       organizationName: org?.name || 'Your Team',
       role: targetRole,
@@ -244,6 +247,20 @@ router.post('/invite', requireRoles(['OWNER', 'ADMIN']), async (req: Authenticat
       emailDelivery: emailResult,
     });
   } catch (err: any) {
+    if (err.status) {
+      res.status(err.status).json({
+        error: err.status === 403 ? 'Forbidden' : 'Conflict',
+        message: err.message,
+      });
+      return;
+    }
+    if (err.code === 'P2002') {
+      res.status(409).json({
+        error: 'Conflict',
+        message: 'A user with this email already exists in your organization',
+      });
+      return;
+    }
     console.error('[User Invite Error]:', err);
     res.status(500).json({ error: 'Internal Server Error', message: 'Failed to invite user' });
   }
@@ -252,6 +269,7 @@ router.post('/invite', requireRoles(['OWNER', 'ADMIN']), async (req: Authenticat
 /**
  * POST /api/v1/users/:id/invitation/resend
  * Resends an existing agent invitation with a freshly rotated single-use token and expiration.
+ * Concurrency-safe: Conditionally updates status='INVITED'.
  */
 router.post('/:id/invitation/resend', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
@@ -279,8 +297,13 @@ router.post('/:id/invitation/resend', requireRoles(['OWNER', 'ADMIN']), async (r
     const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
-    const updated = await prisma.user.update({
-      where: { id: targetUser.id },
+    // Concurrency-safe conditional update
+    const updateResult = await prisma.user.updateMany({
+      where: {
+        id: targetUser.id,
+        organizationId,
+        status: 'INVITED',
+      },
       data: {
         invitationTokenHash: tokenHash,
         invitationExpiresAt: expiresAt,
@@ -288,14 +311,22 @@ router.post('/:id/invitation/resend', requireRoles(['OWNER', 'ADMIN']), async (r
       },
     });
 
+    if (updateResult.count === 0) {
+      res.status(409).json({
+        error: 'Conflict',
+        message: 'Invitation cannot be resent because the user account is no longer pending invitation',
+      });
+      return;
+    }
+
     const invitationUrl = `${config.appUrl}/invite/${rawToken}`;
 
     const emailResult = await EmailService.sendInvitation({
-      to: updated.email,
-      recipientName: `${updated.firstName} ${updated.lastName}`,
+      to: targetUser.email,
+      recipientName: `${targetUser.firstName} ${targetUser.lastName}`.trim(),
       inviterName: inviter.email,
       organizationName: targetUser.organization.name,
-      role: updated.role,
+      role: targetUser.role,
       invitationUrl,
       expiresAt,
     });
@@ -306,9 +337,9 @@ router.post('/:id/invitation/resend', requireRoles(['OWNER', 'ADMIN']), async (r
         userId: inviter.id,
         action: 'INVITATION_RESENT',
         entityType: 'User',
-        entityId: updated.id,
+        entityId: targetUser.id,
         ipAddress: req.ip || req.socket.remoteAddress || null,
-        metadata: JSON.stringify({ email: updated.email, emailDeliveryStatus: emailResult.status }),
+        metadata: JSON.stringify({ email: targetUser.email, emailDeliveryStatus: emailResult.status }),
       },
     });
 
@@ -327,6 +358,7 @@ router.post('/:id/invitation/resend', requireRoles(['OWNER', 'ADMIN']), async (r
 /**
  * DELETE /api/v1/users/:id/invitation
  * Revoke a pending agent invitation.
+ * Concurrency-safe: Conditionally deletes only if status='INVITED'.
  */
 router.delete('/:id/invitation', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
@@ -348,10 +380,21 @@ router.delete('/:id/invitation', requireRoles(['OWNER', 'ADMIN']), async (req: A
       return;
     }
 
-    await prisma.$transaction(async (tx) => {
-      await tx.user.delete({
-        where: { id: targetUser.id },
+    const result = await prisma.$transaction(async (tx) => {
+      // Concurrency defense: delete conditionally where status is still INVITED
+      const deleteResult = await tx.user.deleteMany({
+        where: {
+          id: targetUser.id,
+          organizationId,
+          status: 'INVITED',
+        },
       });
+
+      if (deleteResult.count === 0) {
+        const err: any = new Error('Invitation cannot be revoked because user status has already changed');
+        err.status = 409;
+        throw err;
+      }
 
       await tx.auditEvent.create({
         data: {
@@ -368,6 +411,10 @@ router.delete('/:id/invitation', requireRoles(['OWNER', 'ADMIN']), async (req: A
 
     res.json({ message: 'Invitation revoked successfully' });
   } catch (err: any) {
+    if (err.status) {
+      res.status(err.status).json({ error: 'Conflict', message: err.message });
+      return;
+    }
     console.error('[User Revoke Invitation Error]:', err);
     res.status(500).json({ error: 'Internal Server Error', message: 'Failed to revoke invitation' });
   }

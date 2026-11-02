@@ -554,12 +554,25 @@ async function runSecurityRemediationSuite() {
         firstName: 'Deact',
         lastName: 'Agent',
         role: 'AGENT',
-        initialPassword: 'TempPassword123!',
       },
     });
     assert.strictEqual(deactAgentRes.status, 201);
     const deactAgentId = deactAgentRes.data.user.id;
     createdUserIds.push(deactAgentId);
+
+    // Accept invitation via secure acceptance workflow to activate account
+    const deactInviteToken = deactAgentRes.data.invitationUrl.split('/invite/')[1];
+    const deactAcceptRes = await request({
+      method: 'POST',
+      path: '/api/v1/auth/invitations/accept',
+      body: {
+        token: deactInviteToken,
+        firstName: 'Deact',
+        lastName: 'Agent',
+        password: 'TempPassword123!',
+      },
+    });
+    assert.strictEqual(deactAcceptRes.status, 200);
 
     const deactAgentLogin = await request({
       method: 'POST',

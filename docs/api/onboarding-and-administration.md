@@ -81,6 +81,16 @@ Executes multi-step setup wizard or marks tenant onboarding complete.
 
 - **Authentication**: `Bearer <JWT>`
 - **Authorization**: `OWNER` or `ADMIN`.
+- **Validation Rules**:
+  - `step`: Must be an integer between 1 and 5.
+  - `companyName`: Non-empty string (1 to 100 characters).
+  - `brandColor` / `widgetColor`: Strict 6-character hex format (`^#[0-9A-Fa-f]{6}$`).
+  - `timezone`: Valid IANA timezone identifier validated via V8 `Intl.DateTimeFormat`.
+  - `locale`: Valid BCP 47 language/locale tag.
+  - `logoUrl`: Valid `http:` or `https:` URL with valid hostname.
+  - `allowedDomains`: Domain list or comma-separated origins. Wildcard `*` strictly rejected.
+  - `businessHours`: Day names (`monday`..`sunday`), 24-hr `HH:MM` format, and `start < end` consistency.
+  - `completed: true`: Mandatory readiness check: company name, brand color, timezone, locale, business hours schedule, workspace, and inbox greeting must be satisfied before completion is granted.
 - **Request Body**:
   ```json
   {
