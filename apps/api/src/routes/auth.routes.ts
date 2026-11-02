@@ -6,6 +6,7 @@ import { prisma } from '../prisma';
 import { config } from '../config';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
 import { rateLimiter } from '../middleware/rate-limiter';
+import { disconnectUserSockets } from '../services/socket.service';
 
 const router = Router();
 
@@ -300,7 +301,34 @@ router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
       });
 
       if (updateCount.count === 0) {
-        // Token was already revoked, expired, or non-existent (e.g. concurrent attempt)
+        // Token was already revoked, expired, or non-existent
+        const compromisedToken = await tx.refreshToken.findUnique({
+          where: { tokenHash },
+          include: { user: true },
+        });
+
+        if (compromisedToken && compromisedToken.revoked) {
+          // Token reuse / theft detected! Invalidate entire token family for this user
+          await tx.refreshToken.updateMany({
+            where: { userId: compromisedToken.userId },
+            data: { revoked: true },
+          });
+
+          await tx.auditEvent.create({
+            data: {
+              organizationId: compromisedToken.user.organizationId,
+              userId: compromisedToken.userId,
+              action: 'REFRESH_TOKEN_REUSE_DETECTED',
+              entityType: 'RefreshToken',
+              entityId: tokenHash,
+              ipAddress: req.ip || req.socket.remoteAddress || null,
+              metadata: JSON.stringify({
+                alert: 'Compromised refresh token reuse attempt detected. All active user refresh tokens revoked.',
+              }),
+            },
+          }).catch(() => {});
+        }
+
         return null;
       }
 
@@ -375,10 +403,17 @@ router.post('/logout', async (req: Request, res: Response): Promise<void> => {
 
     if (refreshToken && typeof refreshToken === 'string') {
       const tokenHash = crypto.createHash('sha256').update(refreshToken.trim()).digest('hex');
+      const stored = await prisma.refreshToken.findUnique({
+        where: { tokenHash },
+        select: { userId: true },
+      });
       await prisma.refreshToken.updateMany({
         where: { tokenHash },
         data: { revoked: true },
       });
+      if (stored) {
+        disconnectUserSockets(stored.userId);
+      }
     }
 
     res.json({ message: 'Successfully logged out' });

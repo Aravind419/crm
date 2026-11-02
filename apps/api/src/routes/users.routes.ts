@@ -5,6 +5,7 @@ import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
 import { tenantIsolationGuard } from '../middleware/tenant';
 import { requireRoles } from '../middleware/roles';
 import { EntitlementService } from '../services/entitlement.service';
+import { disconnectUserSockets } from '../services/socket.service';
 
 const router = Router();
 
@@ -152,6 +153,86 @@ router.post('/invite', requireRoles(['OWNER', 'ADMIN']), async (req: Authenticat
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Internal Server Error', message: 'Failed to invite user' });
+  }
+});
+
+/**
+ * PATCH /api/v1/users/:id/status
+ * Admins/Owners activate or deactivate an agent account.
+ * Deactivation immediately revokes all refresh tokens and terminates active WebSockets.
+ */
+router.patch('/:id/status', requireRoles(['OWNER', 'ADMIN']), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const id = String(req.params.id);
+    const { status } = req.body;
+    const organizationId = req.organizationId!;
+
+    if (!status || !['ACTIVE', 'DEACTIVATED'].includes(String(status).toUpperCase())) {
+      res.status(400).json({ error: 'Bad Request', message: 'Valid status (ACTIVE or DEACTIVATED) is required' });
+      return;
+    }
+
+    const targetUser = await prisma.user.findFirst({
+      where: { id, organizationId },
+    });
+
+    if (!targetUser) {
+      res.status(404).json({ error: 'Not Found', message: 'User not found in your organization' });
+      return;
+    }
+
+    if (targetUser.id === req.user!.id && status === 'DEACTIVATED') {
+      res.status(400).json({ error: 'Bad Request', message: 'Cannot deactivate your own account' });
+      return;
+    }
+
+    const updatedUser = await prisma.$transaction(async (tx) => {
+      const u = await tx.user.update({
+        where: { id: targetUser.id },
+        data: { status: String(status).toUpperCase() },
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          role: true,
+          status: true,
+        },
+      });
+
+      if (status === 'DEACTIVATED') {
+        // Revoke all refresh tokens
+        await tx.refreshToken.updateMany({
+          where: { userId: targetUser.id },
+          data: { revoked: true },
+        });
+
+        await tx.auditEvent.create({
+          data: {
+            organizationId,
+            userId: req.user!.id,
+            action: 'USER_DEACTIVATED',
+            entityType: 'User',
+            entityId: targetUser.id,
+            ipAddress: req.ip || req.socket.remoteAddress || null,
+            metadata: JSON.stringify({ deactivatedEmail: targetUser.email }),
+          },
+        });
+      }
+
+      return u;
+    });
+
+    if (status === 'DEACTIVATED') {
+      disconnectUserSockets(targetUser.id);
+    }
+
+    res.json({
+      message: `User status successfully updated to ${status}`,
+      user: updatedUser,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal Server Error', message: 'Failed to update user status' });
   }
 });
 

@@ -46,15 +46,35 @@ router.post('/billing/webhook', async (req: Request, res: Response): Promise<voi
       }
     }
 
-    const expectedSignature = crypto
+    // Support both direct payload signature and timestamp-bound signature (`${timestamp}.${rawPayload}`)
+    const expectedSignatureDirect = crypto
       .createHmac('sha256', config.billingWebhookSecret)
       .update(rawPayload)
       .digest('hex');
 
+    const expectedSignatureBound = timestamp
+      ? crypto
+          .createHmac('sha256', config.billingWebhookSecret)
+          .update(Buffer.concat([Buffer.from(`${timestamp}.`), rawPayload]))
+          .digest('hex')
+      : null;
+
     // Constant-time signature comparison to eliminate timing side-channels
     const sigBuffer = Buffer.from(signature);
-    const expectedBuffer = Buffer.from(expectedSignature);
-    if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
+    const expectedDirectBuffer = Buffer.from(expectedSignatureDirect);
+    const matchesDirect =
+      sigBuffer.length === expectedDirectBuffer.length &&
+      crypto.timingSafeEqual(sigBuffer, expectedDirectBuffer);
+
+    let matchesBound = false;
+    if (expectedSignatureBound) {
+      const expectedBoundBuffer = Buffer.from(expectedSignatureBound);
+      matchesBound =
+        sigBuffer.length === expectedBoundBuffer.length &&
+        crypto.timingSafeEqual(sigBuffer, expectedBoundBuffer);
+    }
+
+    if (!matchesDirect && !matchesBound) {
       res.status(401).json({ error: 'Unauthorized', message: 'Invalid billing webhook signature' });
       return;
     }

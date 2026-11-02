@@ -128,6 +128,7 @@ export function initSocketService(server: HttpServer): SocketIOServer {
         }
 
         socket.data.visitorToken = rawToken;
+        socket.data.tokenHash = tokenHash;
         socket.data.conversationId = convId;
         socket.data.customerId = session.customerId;
         socket.data.isVisitor = true;
@@ -276,3 +277,32 @@ export function broadcastToConversation(conversationId: string, event: string, p
 
   io.to(`conv:${conversationId}`).emit(event, payload);
 }
+
+/**
+ * Immediately severs active WebSocket connections for a revoked visitor session
+ * and emits a session revoked error event so client-side state is purged.
+ */
+export function disconnectVisitorSockets(tokenOrHash: string): void {
+  if (!io || !tokenOrHash) return;
+  const hash = tokenOrHash.length === 64 ? tokenOrHash : crypto.createHash('sha256').update(tokenOrHash).digest('hex');
+  for (const [, socket] of io.sockets.sockets) {
+    if (socket.data?.isVisitor && (socket.data?.tokenHash === hash || socket.data?.visitorToken === tokenOrHash)) {
+      socket.emit('error:session_revoked', { message: 'Visitor session has been revoked' });
+      socket.disconnect(true);
+    }
+  }
+}
+
+/**
+ * Immediately severs active WebSocket connections for a deactivated or logged-out agent.
+ */
+export function disconnectUserSockets(userId: string): void {
+  if (!io || !userId) return;
+  for (const [, socket] of io.sockets.sockets) {
+    if (socket.data?.isAgent && socket.data?.userId === userId) {
+      socket.emit('error:account_deactivated', { message: 'Agent account session has been terminated' });
+      socket.disconnect(true);
+    }
+  }
+}
+

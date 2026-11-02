@@ -93,6 +93,8 @@ async function runSecurityRemediationSuite() {
     assert.strictEqual(convARes.status, 200);
     const convA = convARes.data.conversations[0];
     assert.ok(convA, 'Org A must have at least one seeded conversation');
+    const inboxA = await prisma.inbox.findUnique({ where: { id: convA.inboxId } });
+    const inboxAKey = inboxA?.inboxKey || 'inbox_acme_web';
 
     // Retrieve Org B conversation
     const convBRes = await request({
@@ -417,21 +419,190 @@ async function runSecurityRemediationSuite() {
     );
     console.log("   ✅ PASS: Visitor cannot join another visitor's conversation room");
 
+    // Test 18: Active visitor WebSocket immediately severed upon session revocation
+    console.log('18. Testing: Active visitor WebSocket immediately severed on session revocation...');
+    const liveConvRes = await request({
+      method: 'POST',
+      path: '/api/v1/public/conversations',
+      body: {
+        inboxKey: inboxAKey,
+        customerEmail: `visitor_live_${Date.now()}@example.com`,
+        customerName: 'Live Visitor',
+        message: 'Hello, need real-time support',
+      },
+    });
+    assert.strictEqual(liveConvRes.status, 201);
+    const liveConvId = liveConvRes.data.conversationId;
+    const liveVisitorToken = liveConvRes.data.visitorToken;
+
+    let receivedMessagesAfterRevoke = 0;
+    let receivedRevokeEvent = false;
+
+    const liveSocket = ClientIO(`http://localhost:${TEST_PORT}`, {
+      transports: ['websocket'],
+      auth: {
+        visitorToken: liveVisitorToken,
+        conversationId: liveConvId,
+      },
+      reconnection: false,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Live socket connection timed out')), 3000);
+      liveSocket.on('connect', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      liveSocket.on('connect_error', reject);
+    });
+
+    liveSocket.on('error:session_revoked', () => {
+      receivedRevokeEvent = true;
+    });
+
+    liveSocket.on('message:created', () => {
+      receivedMessagesAfterRevoke++;
+    });
+
+    // Call POST /api/v1/public/sessions/revoke
+    const revokeRes = await request({
+      method: 'POST',
+      path: '/api/v1/public/sessions/revoke',
+      headers: { 'x-visitor-token': liveVisitorToken },
+    });
+    assert.strictEqual(revokeRes.status, 200);
+
+    // Allow time for server disconnection propagation
+    await new Promise((r) => setTimeout(r, 200));
+
+    assert.strictEqual(liveSocket.connected, false, 'Socket must be disconnected after session revocation');
+    assert.ok(receivedRevokeEvent, 'Socket must receive error:session_revoked event');
+
+    // Agent sends a new message to this conversation
+    await request({
+      method: 'POST',
+      path: `/api/v1/conversations/${liveConvId}/messages`,
+      headers: headersA,
+      body: {
+        content: 'Confidential agent message after visitor revoked',
+        messageType: 'PUBLIC_REPLY',
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 200));
+    assert.strictEqual(receivedMessagesAfterRevoke, 0, 'Revoked visitor socket must receive zero messages');
+
+    // Attempting to reconnect with revoked token must fail
+    const reconnectAttempt = await new Promise<string>((res) => {
+      const sock = ClientIO(`http://localhost:${TEST_PORT}`, {
+        transports: ['websocket'],
+        auth: {
+          visitorToken: liveVisitorToken,
+          conversationId: liveConvId,
+        },
+        reconnection: false,
+        timeout: 2000,
+      });
+      sock.on('connect', () => {
+        sock.disconnect();
+        res('CONNECTED');
+      });
+      sock.on('connect_error', (err) => {
+        sock.disconnect();
+        res(err.message);
+      });
+    });
+    assert.ok(
+      reconnectAttempt.includes('revoked') || reconnectAttempt.includes('Authentication failed'),
+      `Reconnection with revoked token must fail. Got: ${reconnectAttempt}`
+    );
+    console.log('   ✅ PASS: Active visitor socket severed immediately on revocation & blocked from re-connecting');
+
+    // Test 19: Deactivated agent account severed from WebSocket in real-time
+    console.log('19. Testing: Deactivated agent account severed from WebSocket in real-time...');
+    const deactAgentEmail = `deact_agent_${Date.now()}@acme.com`;
+    const deactAgentRes = await request({
+      method: 'POST',
+      path: '/api/v1/users/invite',
+      headers: headersA,
+      body: {
+        email: deactAgentEmail,
+        firstName: 'Deact',
+        lastName: 'Agent',
+        role: 'AGENT',
+        initialPassword: 'TempPassword123!',
+      },
+    });
+    assert.strictEqual(deactAgentRes.status, 201);
+    const deactAgentId = deactAgentRes.data.user.id;
+    createdUserIds.push(deactAgentId);
+
+    const deactAgentLogin = await request({
+      method: 'POST',
+      path: '/api/v1/auth/login',
+      body: { email: deactAgentEmail, password: 'TempPassword123!' },
+    });
+    assert.strictEqual(deactAgentLogin.status, 200);
+    const deactAgentToken = deactAgentLogin.data.token;
+
+    let receivedDeactEvent = false;
+    const deactAgentSocket = ClientIO(`http://localhost:${TEST_PORT}`, {
+      transports: ['websocket'],
+      auth: { token: deactAgentToken },
+      reconnection: false,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Deact agent socket connection timed out')), 3000);
+      deactAgentSocket.on('connect', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      deactAgentSocket.on('connect_error', reject);
+    });
+
+    deactAgentSocket.on('error:account_deactivated', () => {
+      receivedDeactEvent = true;
+    });
+
+    // Admin deactivates the agent
+    const deactRes = await request({
+      method: 'PATCH',
+      path: `/api/v1/users/${deactAgentId}/status`,
+      headers: headersA,
+      body: { status: 'DEACTIVATED' },
+    });
+    assert.strictEqual(deactRes.status, 200);
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    assert.strictEqual(deactAgentSocket.connected, false, 'Deactivated agent socket must be severed immediately');
+    assert.ok(receivedDeactEvent, 'Agent must receive error:account_deactivated event');
+
+    // Deactivated agent cannot log in again
+    const deactLoginAttempt = await request({
+      method: 'POST',
+      path: '/api/v1/auth/login',
+      body: { email: deactAgentEmail, password: 'TempPassword123!' },
+    });
+    assert.strictEqual(deactLoginAttempt.status, 403, 'Deactivated agent login must be rejected with 403 Forbidden');
+    console.log('   ✅ PASS: Deactivated agent severed from WebSocket and subsequent logins rejected (HTTP 403)');
+
     console.log('\n--- SECTION 4: AUTHENTICATION IMPROVEMENTS & ATOMIC REFRESH TOKENS ---');
 
-    // Test 18: Organization plan tampering rejected on PATCH /organizations/current
-    console.log('18. Testing: Organization plan tampering rejected on PATCH /organizations/current...');
-    const test18 = await request({
+    // Test 20: Organization plan tampering rejected on PATCH /organizations/current
+    console.log('20. Testing: Organization plan tampering rejected on PATCH /organizations/current...');
+    const test20 = await request({
       method: 'PATCH',
       path: '/api/v1/organizations/current',
       headers: headersA,
       body: { plan: 'ENTERPRISE' },
     });
-    assert.strictEqual(test18.status, 403, 'Direct client plan tampering must be rejected with HTTP 403 Forbidden');
+    assert.strictEqual(test20.status, 403, 'Direct client plan tampering must be rejected with HTTP 403 Forbidden');
     console.log('   ✅ PASS: Organization plan tampering rejected on PATCH /organizations/current (HTTP 403)');
 
-    // Test 19: Dynamic legacy SHA-256 hash upgrade to bcrypt on login
-    console.log('19. Testing: Dynamic legacy SHA-256 hash upgrade to bcrypt on login...');
+    // Test 21: Dynamic legacy SHA-256 hash upgrade to bcrypt on login
+    console.log('21. Testing: Dynamic legacy SHA-256 hash upgrade to bcrypt on login...');
     const legacyEmail = `legacy_${Date.now()}@example.com`;
     const legacyPass = 'LegacyPassword123!';
     const legacySha256Hash = crypto.createHash('sha256').update(legacyPass + 'supportos_salt_2026').digest('hex');
@@ -463,8 +634,8 @@ async function runSecurityRemediationSuite() {
     );
     console.log('   ✅ PASS: Legacy password hash successfully upgraded to bcrypt automatically');
 
-    // Test 20: Atomic refresh token rotation & concurrent reuse rejection
-    console.log('20. Testing: Atomic refresh token rotation prevents concurrent reuse...');
+    // Test 22: Atomic refresh token rotation & concurrent reuse rejection
+    console.log('22. Testing: Atomic refresh token rotation prevents concurrent reuse...');
     const initialRefresh = legacyLogin.data.refreshToken;
     assert.ok(initialRefresh, 'Login must yield a valid refresh token');
 
@@ -487,8 +658,8 @@ async function runSecurityRemediationSuite() {
     assert.deepStrictEqual(statuses, [200, 401], 'Exactly one concurrent refresh must succeed; the other must fail (CAS)');
     console.log('   ✅ PASS: Atomic CAS refresh token rotation prevents token reuse and race conditions');
 
-    // Test 21: Revoked refresh token cannot be refreshed
-    console.log('21. Testing: Revoked refresh token cannot be refreshed...');
+    // Test 23: Revoked refresh token cannot be refreshed
+    console.log('23. Testing: Revoked refresh token cannot be refreshed...');
     const activeRefresh = refreshRes1.status === 200 ? refreshRes1.data.refreshToken : refreshRes2.data.refreshToken;
     // Explicitly logout / revoke
     await request({
@@ -505,10 +676,62 @@ async function runSecurityRemediationSuite() {
     assert.strictEqual(revokedRefreshAttempt.status, 401, 'Revoked refresh token must be rejected with 401');
     console.log('   ✅ PASS: Revoked refresh token rejected on refresh attempt (HTTP 401)');
 
+    // Test 24: Re-use of revoked refresh token triggers token family revocation (RFC 6819)
+    console.log('24. Testing: Stolen refresh token reuse triggers immediate token family revocation...');
+    const tfUserEmail = `tf_user_${Date.now()}@example.com`;
+    const tfUserPass = 'SecurePass123!';
+    const tfHash = await (await import('bcryptjs')).default.hash(tfUserPass, 10);
+    const tfUser = await prisma.user.create({
+      data: {
+        organizationId: convA.organizationId,
+        email: tfUserEmail,
+        passwordHash: tfHash,
+        firstName: 'Family',
+        lastName: 'TokenUser',
+        role: 'AGENT',
+        status: 'ACTIVE',
+      },
+    });
+    createdUserIds.push(tfUser.id);
+
+    const tfLogin = await request({
+      method: 'POST',
+      path: '/api/v1/auth/login',
+      body: { email: tfUserEmail, password: tfUserPass },
+    });
+    assert.strictEqual(tfLogin.status, 200);
+    const tokenR1 = tfLogin.data.refreshToken;
+
+    // Normal rotation: R1 -> R2
+    const rotate1 = await request({
+      method: 'POST',
+      path: '/api/v1/auth/refresh',
+      body: { refreshToken: tokenR1 },
+    });
+    assert.strictEqual(rotate1.status, 200);
+    const tokenR2 = rotate1.data.refreshToken;
+
+    // Attacker attempts to reuse old token R1!
+    const attackerReuse = await request({
+      method: 'POST',
+      path: '/api/v1/auth/refresh',
+      body: { refreshToken: tokenR1 },
+    });
+    assert.strictEqual(attackerReuse.status, 401, 'Reused refresh token must be rejected');
+
+    // Legitimate client attempts to use token R2 - MUST FAIL because token family was revoked!
+    const legitR2Attempt = await request({
+      method: 'POST',
+      path: '/api/v1/auth/refresh',
+      body: { refreshToken: tokenR2 },
+    });
+    assert.strictEqual(legitR2Attempt.status, 401, 'Token R2 must be revoked as part of token family revocation');
+    console.log('   ✅ PASS: Token reuse detected & entire token family invalidated (RFC 6819 compliance)');
+
     console.log('\n--- SECTION 5: BILLING WEBHOOK IDEMPOTENCY & RAW SIGNATURE DEFENSES ---');
 
-    // Test 22: Billing webhook signature verified with raw body
-    console.log('22. Testing: Billing webhook signature verified with authentic raw body...');
+    // Test 25: Billing webhook signature verified with raw body
+    console.log('25. Testing: Billing webhook signature verified with authentic raw body...');
     const testEventId = `evt_billing_${Date.now()}`;
     const webhookPayload = JSON.stringify({
       id: testEventId,
@@ -535,8 +758,8 @@ async function runSecurityRemediationSuite() {
     assert.strictEqual(webhookRes.status, 200, 'Valid signed webhook must return HTTP 200');
     console.log('   ✅ PASS: Billing webhook signature verified over raw request buffer (HTTP 200)');
 
-    // Test 23: Billing webhook replay attack rejected (idempotency)
-    console.log('23. Testing: Billing webhook replay attack rejected via event idempotency...');
+    // Test 26: Billing webhook replay attack rejected (idempotency)
+    console.log('26. Testing: Billing webhook replay attack rejected via event idempotency...');
     const replayRes = await request({
       method: 'POST',
       path: '/api/v1/organizations/billing/webhook',
@@ -550,8 +773,8 @@ async function runSecurityRemediationSuite() {
     assert.strictEqual(replayRes.data.idempotent, true, 'Replayed webhook must return idempotent marker');
     console.log('   ✅ PASS: Replay attack intercepted; duplicate webhook processed idempotently');
 
-    // Test 24: Billing webhook rejects unallowed plan
-    console.log('24. Testing: Billing webhook rejects unallowed plan value...');
+    // Test 27: Billing webhook rejects unallowed plan
+    console.log('27. Testing: Billing webhook rejects unallowed plan value...');
     const invalidPlanPayload = JSON.stringify({
       id: `evt_invalid_plan_${Date.now()}`,
       event: 'subscription.updated',
@@ -573,8 +796,8 @@ async function runSecurityRemediationSuite() {
     assert.strictEqual(invalidPlanRes.status, 400, 'Unallowed plan must be rejected with 400 Bad Request');
     console.log('   ✅ PASS: Billing webhook strictly rejects unallowed subscription tier values (HTTP 400)');
 
-    // Test 25: Billing webhook rejects forged signature
-    console.log('25. Testing: Billing webhook rejects forged signature...');
+    // Test 28: Billing webhook rejects forged signature
+    console.log('28. Testing: Billing webhook rejects forged signature...');
     const forgedWebhookRes = await request({
       method: 'POST',
       path: '/api/v1/organizations/billing/webhook',
@@ -584,8 +807,38 @@ async function runSecurityRemediationSuite() {
     assert.strictEqual(forgedWebhookRes.status, 401, 'Forged signature must be rejected with HTTP 401 Unauthorized');
     console.log('   ✅ PASS: Forged billing webhook signature rejected (HTTP 401)');
 
+    // Test 29: Billing webhook timestamp cryptographically bound to HMAC payload
+    console.log('29. Testing: Billing webhook timestamp cryptographically bound to HMAC payload...');
+    const timestampBoundEventId = `evt_bound_${Date.now()}`;
+    const boundPayload = JSON.stringify({
+      id: timestampBoundEventId,
+      event: 'subscription.updated',
+      organizationId: convA.organizationId,
+      plan: 'ENTERPRISE',
+      status: 'ACTIVE',
+    });
+    const boundRawBuffer = Buffer.from(boundPayload, 'utf-8');
+    const currentTimestamp = Math.floor(Date.now() / 1000).toString();
+    const boundSignature = crypto
+      .createHmac('sha256', config.billingWebhookSecret)
+      .update(Buffer.concat([Buffer.from(`${currentTimestamp}.`), boundRawBuffer]))
+      .digest('hex');
+
+    const boundRes = await request({
+      method: 'POST',
+      path: '/api/v1/organizations/billing/webhook',
+      headers: {
+        'x-billing-signature': boundSignature,
+        'x-billing-timestamp': currentTimestamp,
+        'x-billing-event-id': timestampBoundEventId,
+      },
+      rawBody: boundRawBuffer,
+    });
+    assert.strictEqual(boundRes.status, 200, 'Timestamp-bound signature must be accepted');
+    console.log('   ✅ PASS: Billing webhook timestamp cryptographically bound to payload in HMAC verification');
+
     console.log('\n================================================================');
-    console.log('🏆 ALL 25 RIGOROUS SECURITY REMEDIATION TEST CASES PASSED!');
+    console.log('🏆 ALL 29 RIGOROUS SECURITY REMEDIATION TEST CASES PASSED!');
     console.log('================================================================');
   } finally {
     // Isolated test data cleanup

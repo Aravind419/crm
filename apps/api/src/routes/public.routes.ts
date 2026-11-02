@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import * as crypto from 'crypto';
 import { prisma } from '../prisma';
 import { rateLimiter } from '../middleware/rate-limiter';
-import { broadcastToOrg, broadcastToConversation } from '../services/socket.service';
+import { broadcastToOrg, broadcastToConversation, disconnectVisitorSockets } from '../services/socket.service';
 import { evaluateAutomationRules } from '../services/automation.engine';
 
 const router = Router();
@@ -405,6 +405,9 @@ router.post('/sessions/revoke', async (req: Request, res: Response): Promise<voi
       where: { tokenHash },
       data: { revokedAt: new Date() },
     });
+
+    // Real-time disconnection: Immediately sever any active WebSocket connections bound to this revoked session
+    disconnectVisitorSockets(tokenHash);
 
     res.json({ message: 'Visitor session revoked successfully' });
   } catch (err: any) {
