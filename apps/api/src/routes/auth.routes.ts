@@ -527,14 +527,27 @@ router.get(
 /**
  * GET /api/v1/auth/session-identity
  * Runtime identity & transaction context inspection endpoint.
- * Allows independent verification of the actual database identity (supportos_app)
- * and transaction-local tenant context (app.current_organization_id) without leaking credentials.
+ * Restricted to internal diagnostics / audit runners.
+ * In normal production operations, this endpoint returns 404 Not Found.
  */
 router.get(
   '/session-identity',
   authMiddleware,
   tenantTransactionMiddleware,
   async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    // 1. In production, this diagnostic route is strictly disabled unless explicitly enabled via ENABLE_INTERNAL_DIAGNOSTICS=true
+    const isProd = config.nodeEnv === 'production' || process.env.NODE_ENV === 'production';
+    if (isProd && process.env.ENABLE_INTERNAL_DIAGNOSTICS !== 'true') {
+      res.status(404).json({ error: 'Not Found', message: `Route GET ${req.originalUrl} does not exist` });
+      return;
+    }
+
+    // 2. Only OWNER or ADMIN roles are permitted to access session diagnostic information
+    if (req.user?.role !== 'OWNER' && req.user?.role !== 'ADMIN') {
+      res.status(403).json({ error: 'Forbidden', message: 'Diagnostic route restricted to administrative users' });
+      return;
+    }
+
     try {
       if (isPostgreSql()) {
         const idQuery: any[] = await prisma.$queryRawUnsafe(`

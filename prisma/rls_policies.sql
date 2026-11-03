@@ -7,12 +7,20 @@ DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'supportos_app') THEN
     CREATE ROLE supportos_app WITH LOGIN NOCREATEDB NOCREATEROLE;
+  ELSE
+    ALTER ROLE supportos_app WITH NOCREATEDB NOCREATEROLE;
+  END IF;
+
+  -- If connected user has superuser privileges (e.g. native CI container), explicitly enforce NOSUPERUSER NOBYPASSRLS
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = CURRENT_USER AND rolsuper = true) THEN
+    EXECUTE 'ALTER ROLE supportos_app WITH NOSUPERUSER NOBYPASSRLS';
   END IF;
 END
 $$;
 
 -- Grant schema and table access to supportos_app (Least Privilege: SELECT, INSERT, UPDATE, DELETE only)
 GRANT USAGE ON SCHEMA public TO supportos_app;
+REVOKE CREATE ON SCHEMA public FROM supportos_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO supportos_app;
 REVOKE ALL PRIVILEGES ON TABLE "_prisma_migrations" FROM supportos_app;
 REVOKE TRUNCATE, TRIGGER, REFERENCES ON ALL TABLES IN SCHEMA public FROM supportos_app;

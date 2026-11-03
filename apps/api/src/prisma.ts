@@ -124,10 +124,22 @@ export const prisma = new Proxy(basePrisma, {
 
     // 4. If attempting to access a tenant-owned model without active tenant context:
     if (TENANT_MODELS.has(String(prop))) {
-      // In test mode or administrative scripts (strictly non-production), allow automatic transaction scoping if explicit org context exists
+      // PRODUCTION SECURITY GATE:
+      // In production, ALL access to tenant-owned models MUST execute within an explicit transaction-local tenant context (runInTenantContext).
+      // Any attempt to execute an unscoped query against tenant data in production fails closed immediately.
+      // Environment flags (such as ALLOW_UNSCOPED_ADMIN_QUERIES) and provider fallbacks are strictly rejected in production.
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error(
+          `[Tenant Isolation Violation] Unscoped access to tenant-owned model "${String(prop)}" is strictly prohibited in production. All tenant data queries must execute within an active transaction-local tenant context (runInTenantContext).`
+        );
+      }
+
+      // NON-PRODUCTION TEST & ADMINISTRATIVE CLI HARNESS:
+      // In non-production testing, if an explicit organization context can be unambiguously resolved from query parameters,
+      // wrap the operation in a transaction-local tenant context automatically for test harness convenience.
       if (
-        process.env.NODE_ENV !== 'production' &&
-        (process.env.NODE_ENV === 'test' || process.env.ALLOW_UNSCOPED_ADMIN_QUERIES === 'true')
+        process.env.NODE_ENV === 'test' ||
+        process.env.ALLOW_UNSCOPED_ADMIN_QUERIES === 'true'
       ) {
         const modelTarget = (basePrisma as any)[prop];
         return new Proxy(modelTarget, {
@@ -269,11 +281,10 @@ export const prisma = new Proxy(basePrisma, {
         });
       }
 
-      if (isPostgreSql()) {
-        throw new Error(
-          `[Tenant Isolation Violation] Unscoped access to tenant-owned model "${String(prop)}" is prohibited. All tenant data queries must execute within an active transaction-local tenant context (runInTenantContext).`
-        );
-      }
+      // Fail closed: All tenant-owned queries without active tenant context are rejected
+      throw new Error(
+        `[Tenant Isolation Violation] Unscoped access to tenant-owned model "${String(prop)}" is prohibited. All tenant data queries must execute within an active transaction-local tenant context (runInTenantContext).`
+      );
     }
 
     const val = (target as any)[prop];

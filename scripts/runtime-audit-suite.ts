@@ -108,8 +108,10 @@ function recordResult(
 }
 
 async function runRuntimeAudit() {
+  process.env.ENABLE_INTERNAL_DIAGNOSTICS = 'true';
+
   console.log('================================================================================');
-  console.log('🚀 SUPPORTOS PHASE 1.5.1 RUNTIME SECURITY & POSTGRESQL RLS AUDIT SUITE');
+  console.log('🚀 SUPPORTOS PHASE 1.5.2 RUNTIME SECURITY & POSTGRESQL RLS AUDIT SUITE');
   console.log('================================================================================\n');
 
   // Start HTTP Server
@@ -149,30 +151,30 @@ async function runRuntimeAudit() {
 
       // 1.2 Check dedicated role supportos_app attributes
       const appRoleAttrs: any[] = await prismaAdmin.$queryRawUnsafe(`
-        SELECT rolname, rolsuper, rolbypassrls, rolcanlogin, rolcreaterole
+        SELECT rolname, rolsuper, rolbypassrls, rolcanlogin, rolcreaterole, rolcreatedb
         FROM pg_roles WHERE rolname = 'supportos_app';
       `);
       if (appRoleAttrs.length > 0) {
         const r = appRoleAttrs[0];
-        if (!r.rolsuper && !r.rolbypassrls && !r.rolcreaterole) {
+        if (!r.rolsuper && !r.rolbypassrls && !r.rolcreaterole && !r.rolcreatedb) {
           recordResult(
             '1. Database Role',
-            'Application role has NOSUPERUSER, NOBYPASSRLS, NOCREATEROLE',
+            'Application role has NOSUPERUSER, NOBYPASSRLS, NOCREATEROLE, NOCREATEDB',
             'VERIFIED',
-            `supportos_app verified: rolsuper=${r.rolsuper}, rolbypassrls=${r.rolbypassrls}, rolcreaterole=${r.rolcreaterole}.`
+            `supportos_app verified: rolsuper=${r.rolsuper}, rolbypassrls=${r.rolbypassrls}, rolcreaterole=${r.rolcreaterole}, rolcreatedb=${r.rolcreatedb}.`
           );
         } else {
           recordResult(
             '1. Database Role',
-            'Application role has NOSUPERUSER, NOBYPASSRLS, NOCREATEROLE',
+            'Application role has NOSUPERUSER, NOBYPASSRLS, NOCREATEROLE, NOCREATEDB',
             'FAILED',
-            `supportos_app has excessive role flags: rolsuper=${r.rolsuper}, rolbypassrls=${r.rolbypassrls}.`
+            `supportos_app has excessive role flags: rolsuper=${r.rolsuper}, rolbypassrls=${r.rolbypassrls}, rolcreaterole=${r.rolcreaterole}, rolcreatedb=${r.rolcreatedb}.`
           );
         }
       } else {
         recordResult(
           '1. Database Role',
-          'Application role has NOSUPERUSER, NOBYPASSRLS, NOCREATEROLE',
+          'Application role has NOSUPERUSER, NOBYPASSRLS, NOCREATEROLE, NOCREATEDB',
           'FAILED',
           'Role supportos_app does not exist in PostgreSQL.'
         );
@@ -239,6 +241,80 @@ async function runRuntimeAudit() {
           'Runtime role and migration role are not properly separated in active configuration.'
         );
       }
+
+      // 1.6 Verify schema public CREATE privilege revoked from supportos_app
+      const schemaPriv: any[] = await prismaAdmin.$queryRawUnsafe(`
+        SELECT has_schema_privilege('supportos_app', 'public', 'CREATE') AS has_create;
+      `);
+      if (schemaPriv[0]?.has_create === false) {
+        recordResult(
+          '1. Database Role',
+          'Schema public CREATE privilege revoked from application role',
+          'VERIFIED',
+          'supportos_app possesses no CREATE privilege on schema public.'
+        );
+      } else {
+        recordResult(
+          '1. Database Role',
+          'Schema public CREATE privilege revoked from application role',
+          'FAILED',
+          'supportos_app has CREATE privilege on schema public.'
+        );
+      }
+
+      // 1.7 Verify no privileged role memberships in pg_auth_members
+      const roleMemberships: any[] = await prismaAdmin.$queryRawUnsafe(`
+        SELECT r.rolname AS parent_role
+        FROM pg_auth_members m
+        JOIN pg_roles r ON m.roleid = r.oid
+        JOIN pg_roles member ON m.member = member.oid
+        WHERE member.rolname = 'supportos_app';
+      `);
+      if (roleMemberships.length === 0) {
+        recordResult(
+          '1. Database Role',
+          'Application role has zero privileged role memberships in pg_auth_members',
+          'VERIFIED',
+          'supportos_app has no parent role memberships.'
+        );
+      } else {
+        recordResult(
+          '1. Database Role',
+          'Application role has zero privileged role memberships in pg_auth_members',
+          'FAILED',
+          `supportos_app is granted membership in roles: ${roleMemberships.map((m: any) => m.parent_role).join(', ')}`
+        );
+      }
+
+      // 1.8 Verify _prisma_migrations is completely protected against supportos_app
+      const migPrivs: any[] = await prismaAdmin.$queryRawUnsafe(`
+        SELECT privilege_type 
+        FROM information_schema.table_privileges 
+        WHERE table_name = '_prisma_migrations' AND grantee = 'supportos_app';
+      `);
+      let migQueryBlocked = false;
+      try {
+        await prismaApp.$queryRawUnsafe('SELECT * FROM "_prisma_migrations" LIMIT 1;');
+      } catch (e: any) {
+        if (e.message.includes('permission denied') || e.code === '42501' || e.message.includes('42501')) {
+          migQueryBlocked = true;
+        }
+      }
+      if (migPrivs.length === 0 && migQueryBlocked) {
+        recordResult(
+          '1. Database Role',
+          '_prisma_migrations inaccessible to application role',
+          'VERIFIED',
+          'supportos_app has 0 privileges on _prisma_migrations and query is blocked with 42501.'
+        );
+      } else {
+        recordResult(
+          '1. Database Role',
+          '_prisma_migrations inaccessible to application role',
+          'FAILED',
+          `Privileges: ${migPrivs.length}, Query blocked: ${migQueryBlocked}`
+        );
+      }
     } catch (err: any) {
       recordResult('1. Database Role', 'PostgreSQL Role Audit Execution', 'FAILED', err.message);
     }
@@ -262,6 +338,7 @@ async function runRuntimeAudit() {
       orgA = loginA.data.organization;
 
       // 2.2 Verify actual API runtime database identity via /api/v1/auth/session-identity
+      // 2.2a OWNER access with ENABLE_INTERNAL_DIAGNOSTICS=true
       const identityRes = await request({
         method: 'GET',
         path: '/api/v1/auth/session-identity',
@@ -285,6 +362,65 @@ async function runRuntimeAudit() {
           'Runtime database identity endpoint verification (GET /session-identity)',
           'FAILED',
           `Expected currentUser=supportos_app and currentOrganizationId=${orgA.id}, got status ${identityRes.status}, data: ${JSON.stringify(identityRes.data)}`
+        );
+      }
+
+      // 2.2b AGENT access forbidden (403)
+      const loginAgentA = await request({
+        method: 'POST',
+        path: '/api/v1/auth/login',
+        body: { email: 'vikram@acme.com', password: 'Password123!' },
+      });
+      assert.strictEqual(loginAgentA.status, 200, 'Agent login must succeed');
+      const agentToken = loginAgentA.data.token;
+
+      const agentDiagRes = await request({
+        method: 'GET',
+        path: '/api/v1/auth/session-identity',
+        headers: { Authorization: `Bearer ${agentToken}` },
+      });
+      if (agentDiagRes.status === 403) {
+        recordResult(
+          '2. Application RLS & Identity',
+          'Session identity endpoint rejects AGENT role with 403',
+          'VERIFIED',
+          'AGENT role correctly received HTTP 403 Forbidden.'
+        );
+      } else {
+        recordResult(
+          '2. Application RLS & Identity',
+          'Session identity endpoint rejects AGENT role with 403',
+          'FAILED',
+          `Expected 403, got status ${agentDiagRes.status}`
+        );
+      }
+
+      // 2.2c Production mode with ENABLE_INTERNAL_DIAGNOSTICS=false returns 404
+      const origNodeEnv = process.env.NODE_ENV;
+      const origDiag = process.env.ENABLE_INTERNAL_DIAGNOSTICS;
+      process.env.NODE_ENV = 'production';
+      process.env.ENABLE_INTERNAL_DIAGNOSTICS = 'false';
+      const prodDiagRes = await request({
+        method: 'GET',
+        path: '/api/v1/auth/session-identity',
+        headers: { Authorization: `Bearer ${tokenA}` },
+      });
+      process.env.NODE_ENV = origNodeEnv;
+      process.env.ENABLE_INTERNAL_DIAGNOSTICS = origDiag;
+
+      if (prodDiagRes.status === 404) {
+        recordResult(
+          '2. Application RLS & Identity',
+          'Session identity endpoint returns 404 in production without diagnostics flag',
+          'VERIFIED',
+          'Production environment without ENABLE_INTERNAL_DIAGNOSTICS=true returned HTTP 404 Not Found.'
+        );
+      } else {
+        recordResult(
+          '2. Application RLS & Identity',
+          'Session identity endpoint returns 404 in production without diagnostics flag',
+          'FAILED',
+          `Expected 404, got status ${prodDiagRes.status}`
         );
       }
 
@@ -566,8 +702,68 @@ async function runRuntimeAudit() {
       const teamsBRes = await request({ method: 'GET', path: '/api/v1/teams', headers: headersB });
       teamB = teamsBRes.data.teams?.[0];
 
-      // 3.1 Cross-Tenant Conversation GET
-      if (convB) {
+      // Auto-provision any missing Starlight fixtures so mandatory test cases are executed deterministically
+      if (!customerB) {
+        customerB = await prismaAdmin.customer.create({
+          data: {
+            organizationId: orgB.id,
+            name: 'Starlight Fixture Customer',
+            email: 'fixture@starlight.test',
+          },
+        });
+      }
+      if (!teamB) {
+        teamB = await prismaAdmin.team.create({
+          data: {
+            organizationId: orgB.id,
+            name: 'Starlight Fixture Team',
+          },
+        });
+      }
+      if (!convB) {
+        let inboxB = await prismaAdmin.inbox.findFirst({ where: { organizationId: orgB.id } });
+        if (!inboxB) {
+          inboxB = await prismaAdmin.inbox.create({
+            data: {
+              organizationId: orgB.id,
+              name: 'Starlight Support',
+              inboxKey: `inbox-b-${Date.now()}`,
+            },
+          });
+        }
+        convB = await prismaAdmin.conversation.create({
+          data: {
+            organizationId: orgB.id,
+            inboxId: inboxB.id,
+            customerId: customerB.id,
+            status: 'OPEN',
+            priority: 'MEDIUM',
+          },
+        });
+      }
+      if (!ticketB) {
+        ticketB = await prismaAdmin.ticket.create({
+          data: {
+            organizationId: orgB.id,
+            customerId: customerB.id,
+            ticketNumber: 888100,
+            title: 'Starlight Fixture Ticket',
+            description: 'Fixture description',
+            status: 'OPEN',
+            priority: 'MEDIUM',
+          },
+        });
+      }
+
+      // 3.1 Cross-Tenant Conversation GET (Mandatory Fixture)
+      if (!convB) {
+        recordResult(
+          '3. Tenant Isolation',
+          'Cross-tenant GET conversation',
+          'BLOCKED',
+          'Mandatory fixture convB is missing in Starlight tenant.'
+        );
+      } else {
         const crossConv = await request({
           method: 'GET',
           path: `/api/v1/conversations/${convB.id}`,
@@ -590,8 +786,15 @@ async function runRuntimeAudit() {
         }
       }
 
-      // 3.2 Cross-Tenant Ticket PATCH
-      if (ticketB) {
+      // 3.2 Cross-Tenant Ticket PATCH (Mandatory Fixture)
+      if (!ticketB) {
+        recordResult(
+          '3. Tenant Isolation',
+          'Cross-tenant PATCH ticket',
+          'BLOCKED',
+          'Mandatory fixture ticketB is missing in Starlight tenant.'
+        );
+      } else {
         const crossTicket = await request({
           method: 'PATCH',
           path: `/api/v1/tickets/${ticketB.id}`,
@@ -615,8 +818,21 @@ async function runRuntimeAudit() {
         }
       }
 
-      // 3.3 Cross-Tenant Customer GET and PATCH
-      if (customerB) {
+      // 3.3 Cross-Tenant Customer GET and PATCH (Mandatory Fixture)
+      if (!customerB) {
+        recordResult(
+          '3. Tenant Isolation',
+          'Cross-tenant GET customer profile',
+          'BLOCKED',
+          'Mandatory fixture customerB is missing in Starlight tenant.'
+        );
+        recordResult(
+          '3. Tenant Isolation',
+          'Cross-tenant PATCH customer profile',
+          'BLOCKED',
+          'Mandatory fixture customerB is missing in Starlight tenant.'
+        );
+      } else {
         const crossCust = await request({
           method: 'GET',
           path: `/api/v1/customers/${customerB.id}`,
@@ -661,8 +877,21 @@ async function runRuntimeAudit() {
         }
       }
 
-      // 3.4 Cross-Tenant Team PATCH and DELETE
-      if (teamB) {
+      // 3.4 Cross-Tenant Team PATCH and DELETE (Mandatory Fixture)
+      if (!teamB) {
+        recordResult(
+          '3. Tenant Isolation',
+          'Cross-tenant PATCH team',
+          'BLOCKED',
+          'Mandatory fixture teamB is missing in Starlight tenant.'
+        );
+        recordResult(
+          '3. Tenant Isolation',
+          'Cross-tenant DELETE team',
+          'BLOCKED',
+          'Mandatory fixture teamB is missing in Starlight tenant.'
+        );
+      } else {
         const crossTeamPatch = await request({
           method: 'PATCH',
           path: `/api/v1/teams/${teamB.id}`,
@@ -1082,10 +1311,29 @@ async function runRuntimeAudit() {
       }
 
       // 6.4 Deactivated User Rejection
-      const inactiveUser = await prismaAdmin.user.findFirst({
+      let inactiveUser = await prismaAdmin.user.findFirst({
         where: { status: 'DEACTIVATED' },
       });
-      if (inactiveUser) {
+      if (!inactiveUser) {
+        inactiveUser = await prismaAdmin.user.create({
+          data: {
+            organizationId: orgA.id,
+            email: `deactivated-${Date.now()}@acme.com`,
+            name: 'Deactivated Fixture User',
+            role: 'AGENT',
+            status: 'DEACTIVATED',
+          },
+        });
+      }
+
+      if (!inactiveUser) {
+        recordResult(
+          '6. Auth & AuthZ',
+          'Deactivated user rejection in auth middleware',
+          'BLOCKED',
+          'Deactivated user fixture could not be resolved or created.'
+        );
+      } else {
         const deactToken = jwt.sign(
           {
             userId: inactiveUser.id,
@@ -1113,16 +1361,9 @@ async function runRuntimeAudit() {
             '6. Auth & AuthZ',
             'Deactivated user rejection in auth middleware',
             'FAILED',
-            `Received status ${deactRes.status}.`
+            `Expected status 401 or 403 for deactivated user, received ${deactRes.status}.`
           );
         }
-      } else {
-        recordResult(
-          '6. Auth & AuthZ',
-          'Deactivated user rejection in auth middleware',
-          'VERIFIED',
-          'auth.ts explicitly verifies user.status === "ACTIVE" and returns 401/403.'
-        );
       }
 
       // 6.5 Role Escalation Defense
@@ -1381,10 +1622,10 @@ async function runRuntimeAudit() {
     console.log('');
   }
 
-  if (failedCount > 0) {
-    console.error(`❌ PRODUCTION GATE FAILED: ${failedCount} security assertion(s) failed.`);
+  if (failedCount > 0 || blockedCount > 0) {
+    console.error(`❌ PRODUCTION GATE FAILED: ${failedCount} security assertion(s) failed, ${blockedCount} check(s) blocked.`);
     auditResults
-      .filter((r) => r.status === 'FAILED')
+      .filter((r) => r.status === 'FAILED' || r.status === 'BLOCKED')
       .forEach((r) => console.error(`   - [${r.section}] ${r.testName}: ${r.details}`));
     process.exit(1);
   }

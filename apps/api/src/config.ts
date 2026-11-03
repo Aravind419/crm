@@ -18,6 +18,8 @@ export const config = {
   redisUrl: process.env.REDIS_URL || null,
   requireRedis: process.env.REQUIRE_REDIS === 'true',
   trustProxy: process.env.TRUST_PROXY === 'true',
+  emailDriver: process.env.EMAIL_DRIVER || (process.env.NODE_ENV === 'production' ? 'smtp' : 'mock'),
+  enableInternalDiagnostics: process.env.ENABLE_INTERNAL_DIAGNOSTICS === 'true',
   appUrl: (process.env.APP_URL && !process.env.APP_URL.includes('localhost'))
     ? process.env.APP_URL
     : (process.env.NEXT_PUBLIC_APP_URL && !process.env.NEXT_PUBLIC_APP_URL.includes('localhost'))
@@ -87,6 +89,23 @@ export function validateSecurityConfig(customCfg?: Partial<typeof config>): void
           `[CRITICAL SECURITY ERROR] Invalid CORS_ORIGIN URL "${origin}": ${e.message}`
         );
       }
+    }
+
+    const emailDriver = customCfg?.emailDriver ?? process.env.EMAIL_DRIVER;
+    if (emailDriver === 'mock') {
+      throw new Error(
+        '[CRITICAL SECURITY ERROR] Production environment cannot use mock email delivery (EMAIL_DRIVER=mock). Real transactional SMTP or Resend credentials must be configured.'
+      );
+    }
+    if (emailDriver === 'smtp' && (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS)) {
+      throw new Error(
+        '[CRITICAL SECURITY ERROR] EMAIL_DRIVER=smtp in production requires SMTP_HOST, SMTP_USER, and SMTP_PASS.'
+      );
+    }
+    if (emailDriver === 'resend' && !process.env.RESEND_API_KEY) {
+      throw new Error(
+        '[CRITICAL SECURITY ERROR] EMAIL_DRIVER=resend in production requires RESEND_API_KEY.'
+      );
     }
   }
 }

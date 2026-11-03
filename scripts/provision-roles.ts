@@ -130,7 +130,7 @@ async function main() {
 
     // 4. Verify role attributes in system catalogs
     const roleCheck: any[] = await prisma.$queryRaw`
-      SELECT rolname, rolsuper, rolbypassrls, rolcanlogin 
+      SELECT rolname, rolsuper, rolbypassrls, rolcanlogin, rolcreatedb, rolcreaterole
       FROM pg_roles 
       WHERE rolname = 'supportos_app';
     `;
@@ -145,9 +145,34 @@ async function main() {
     console.log(`   - Superuser (rolsuper): ${role.rolsuper} (Must be false)`);
     console.log(`   - Bypass RLS (rolbypassrls): ${role.rolbypassrls} (Must be false)`);
     console.log(`   - Can Login (rolcanlogin): ${role.rolcanlogin} (Must be true)`);
+    console.log(`   - Create DB (rolcreatedb): ${role.rolcreatedb} (Must be false)`);
+    console.log(`   - Create Role (rolcreaterole): ${role.rolcreaterole} (Must be false)`);
 
-    if (role.rolsuper || role.rolbypassrls) {
-      throw new Error('SECURITY VIOLATION: supportos_app possesses superuser or bypassrls privileges!');
+    if (role.rolsuper || role.rolbypassrls || role.rolcreatedb || role.rolcreaterole) {
+      throw new Error('SECURITY VIOLATION: supportos_app possesses elevated superuser, bypassrls, createdb, or createrole privileges!');
+    }
+
+    // 4b. Verify CREATE privilege revoked on schema public
+    const schemaPriv: any[] = await prisma.$queryRaw`
+      SELECT has_schema_privilege('supportos_app', 'public', 'CREATE') AS has_create;
+    `;
+    const hasCreate = schemaPriv[0]?.has_create;
+    console.log(`   - Schema public CREATE privilege: ${hasCreate} (Must be false)`);
+    if (hasCreate) {
+      throw new Error('SECURITY VIOLATION: supportos_app possesses CREATE privilege on schema public!');
+    }
+
+    // 4c. Verify no membership in privileged roles via pg_auth_members
+    const roleMemberships: any[] = await prisma.$queryRaw`
+      SELECT r.rolname AS parent_role
+      FROM pg_auth_members m
+      JOIN pg_roles r ON m.roleid = r.oid
+      JOIN pg_roles member ON m.member = member.oid
+      WHERE member.rolname = 'supportos_app';
+    `;
+    console.log(`   - Role memberships: ${roleMemberships.length === 0 ? 'None (Clean)' : roleMemberships.map((m: any) => m.parent_role).join(', ')}`);
+    if (roleMemberships.length > 0) {
+      throw new Error(`SECURITY VIOLATION: supportos_app is granted membership in parent roles: ${roleMemberships.map((m: any) => m.parent_role).join(', ')}`);
     }
 
     // 5. Verify table ownership

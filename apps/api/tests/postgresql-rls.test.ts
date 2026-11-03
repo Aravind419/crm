@@ -53,15 +53,18 @@ async function runPostgresRlsTests() {
       `SECURITY VIOLATION: Native RLS tests must execute under unprivileged role "supportos_app", but connected as "${connectedRole}".`
     );
 
-    // Verify role attributes
+    // Verify role attributes in system catalog
     const roleAttrs: any[] = await prismaAdmin.$queryRawUnsafe(`
-      SELECT rolname, rolsuper, rolbypassrls, rolcanlogin 
+      SELECT rolname, rolsuper, rolbypassrls, rolcanlogin, rolcreatedb, rolcreaterole
       FROM pg_roles 
       WHERE rolname = 'supportos_app';
     `);
     assert.ok(roleAttrs.length > 0, 'Role supportos_app must exist');
     assert.strictEqual(roleAttrs[0].rolsuper, false, 'supportos_app must be NOSUPERUSER');
     assert.strictEqual(roleAttrs[0].rolbypassrls, false, 'supportos_app must be NOBYPASSRLS');
+    assert.strictEqual(roleAttrs[0].rolcanlogin, true, 'supportos_app must have rolcanlogin = true');
+    assert.strictEqual(roleAttrs[0].rolcreatedb, false, 'supportos_app must be NOCREATEDB');
+    assert.strictEqual(roleAttrs[0].rolcreaterole, false, 'supportos_app must be NOCREATEROLE');
 
     // Verify zero table ownership
     const ownedTables: any[] = await prismaAdmin.$queryRawUnsafe(`
@@ -74,7 +77,59 @@ async function runPostgresRlsTests() {
       0,
       `SECURITY VIOLATION: supportos_app owns ${ownedTables.length} tables! supportos_app must own 0 tables.`
     );
-    console.log('   ✅ PASS: supportos_app verified (NOSUPERUSER, NOBYPASSRLS, 0 table ownership).');
+
+    // Verify CREATE privilege is revoked on schema public
+    const schemaPriv: any[] = await prismaAdmin.$queryRawUnsafe(`
+      SELECT has_schema_privilege('supportos_app', 'public', 'CREATE') AS has_create;
+    `);
+    assert.strictEqual(
+      schemaPriv[0]?.has_create,
+      false,
+      'SECURITY VIOLATION: supportos_app must not have CREATE privilege on schema public'
+    );
+
+    // Verify no privileged role memberships in pg_auth_members
+    const roleMemberships: any[] = await prismaAdmin.$queryRawUnsafe(`
+      SELECT r.rolname AS parent_role
+      FROM pg_auth_members m
+      JOIN pg_roles r ON m.roleid = r.oid
+      JOIN pg_roles member ON m.member = member.oid
+      WHERE member.rolname = 'supportos_app';
+    `);
+    assert.strictEqual(
+      roleMemberships.length,
+      0,
+      `SECURITY VIOLATION: supportos_app has memberships in roles: ${roleMemberships.map((m: any) => m.parent_role).join(', ')}`
+    );
+
+    // Verify _prisma_migrations is completely inaccessible to supportos_app
+    const migrationPrivs: any[] = await prismaAdmin.$queryRawUnsafe(`
+      SELECT privilege_type 
+      FROM information_schema.table_privileges 
+      WHERE table_name = '_prisma_migrations' AND grantee = 'supportos_app';
+    `);
+    assert.strictEqual(
+      migrationPrivs.length,
+      0,
+      `SECURITY VIOLATION: supportos_app has privileges on _prisma_migrations: ${migrationPrivs.map((p: any) => p.privilege_type).join(', ')}`
+    );
+
+    // Direct read attempt on _prisma_migrations as supportos_app must fail closed
+    let migrationBlocked = false;
+    try {
+      await appPrisma.$queryRawUnsafe('SELECT * FROM "_prisma_migrations" LIMIT 1;');
+    } catch (err: any) {
+      migrationBlocked = true;
+      assert.ok(
+        err.message.includes('permission denied') ||
+          err.message.includes('42501') ||
+          err.code === '42501',
+        `Expected permission denied error on _prisma_migrations, got: ${err.message}`
+      );
+    }
+    assert.strictEqual(migrationBlocked, true, 'supportos_app must be strictly denied access to _prisma_migrations');
+
+    console.log('   ✅ PASS: supportos_app verified (NOSUPERUSER, NOBYPASSRLS, NOCREATEDB, NOCREATEROLE, 0 table ownership, no CREATE on public, 0 migration access).');
 
     // 1. Verify RLS is enabled in pg_class across all tenant tables
     console.log('\n1. Verifying PostgreSQL pg_class table security attributes...');
@@ -213,6 +268,132 @@ async function runPostgresRlsTests() {
     }
     assert.strictEqual(rlsBlocked, true, 'PostgreSQL RLS MUST block insert with mismatched organizationId');
     console.log('   ✅ PASS: PostgreSQL RLS policy rejected cross-tenant INSERT with check violation.');
+
+    // 6. Test Connection Pool Reuse and Session Variable Reset
+    console.log('\n5. Testing Connection Pool Reuse & Session Variable Cleanup...');
+    // Run transaction with Acme
+    await appPrisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${acmeOrg.id}';`);
+    });
+    // Immediately run standalone query without setting session variable
+    const settingRows: any[] = await appPrisma.$queryRawUnsafe(`SELECT current_setting('app.current_organization_id', true) AS current_org;`);
+    const currentOrg = settingRows[0]?.current_org;
+    assert.ok(!currentOrg || currentOrg === '', `Session setting must be empty after transaction commit, but found "${currentOrg}"`);
+    const defaultVisibleConvs: any[] = await appPrisma.$queryRawUnsafe(`SELECT * FROM "conversations";`);
+    assert.strictEqual(defaultVisibleConvs.length, 0, 'Standalone query without active session setting must see 0 tenant records');
+    console.log('   ✅ PASS: Session setting resets cleanly after transaction commit; unauthenticated queries see 0 rows.');
+
+    // 7. Test 10 Concurrent Interleaved Transactions
+    console.log('\n6. Testing 10 Concurrent Interleaved Cross-Tenant Transactions...');
+    const concurrentCount = 10;
+    const tasks = Array.from({ length: concurrentCount }, async (_, idx) => {
+      const isAcme = idx % 2 === 0;
+      const expectedOrgId = isAcme ? acmeOrg.id : starlightOrg.id;
+      const otherOrgId = isAcme ? starlightOrg.id : acmeOrg.id;
+
+      return appPrisma.$transaction(
+        async (tx) => {
+          // Set session
+          await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${expectedOrgId}';`);
+
+          // Small artificial delay to interleave execution
+          await new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * 20)));
+
+          // Query conversations
+          const rows: any[] = await tx.$queryRawUnsafe(`SELECT * FROM "conversations";`);
+          for (const r of rows) {
+            const org = r.organizationId || r.organization_id;
+            assert.strictEqual(org, expectedOrgId, `Isolation leak in concurrent worker ${idx}: expected ${expectedOrgId}, got ${org}`);
+          }
+
+          // Query other org's conversations - must be 0
+          const otherRows: any[] = await tx.$queryRawUnsafe(`SELECT * FROM "conversations" WHERE "organizationId" = '${otherOrgId}';`);
+          assert.strictEqual(otherRows.length, 0, `Isolation leak in concurrent worker ${idx}: saw ${otherRows.length} rows belonging to other tenant!`);
+          return true;
+        },
+        { timeout: 30000, maxWait: 15000 }
+      );
+    });
+
+    await Promise.all(tasks);
+    console.log(`   ✅ PASS: All ${concurrentCount} concurrent interleaved transactions executed without tenant leaks.`);
+
+    // 8. Test runInTenantContext: Nested Same-Tenant Flattening & Cross-Tenant Rejection
+    console.log('\n7. Testing runInTenantContext transaction lifecycle and nesting...');
+    const { runInTenantContext, tenantStorage } = await import('../src/tenancy/tenant-context');
+
+    // Test same-tenant nested flattening
+    let nestedRan = false;
+    await runInTenantContext(acmeOrg.id, async (outerTx) => {
+      await runInTenantContext(acmeOrg.id, async (innerTx) => {
+        assert.strictEqual(innerTx, outerTx, 'Nested runInTenantContext for identical tenant must reuse outer transaction');
+        nestedRan = true;
+      });
+    });
+    assert.strictEqual(nestedRan, true, 'Nested same-tenant execution completed successfully');
+    console.log('   ✅ PASS: Same-tenant nested runInTenantContext properly flattened into active transaction.');
+
+    // Test cross-tenant nested rejection
+    let crossTenantRejected = false;
+    try {
+      await runInTenantContext(acmeOrg.id, async () => {
+        await runInTenantContext(starlightOrg.id, async () => {
+          // Should never reach here
+        });
+      });
+    } catch (err: any) {
+      crossTenantRejected = true;
+      assert.ok(
+        err.message.includes('Tenant Security Violation') || err.message.includes('Cross-tenant context switch'),
+        `Unexpected cross-tenant error message: ${err.message}`
+      );
+    }
+    assert.strictEqual(crossTenantRejected, true, 'Cross-tenant nested runInTenantContext MUST throw an error');
+    console.log('   ✅ PASS: Cross-tenant nested runInTenantContext strictly rejected.');
+
+    // 9. Test Transaction Rollback after Exception
+    console.log('\n8. Testing Transaction Rollback after Exception...');
+    const rollbackTestId = 'test-rollback-' + Date.now();
+    let rollbackThrown = false;
+    try {
+      await appPrisma.$transaction(
+        async (tx) => {
+          await tx.$executeRawUnsafe(`SET LOCAL app.current_organization_id = '${acmeOrg.id}';`);
+          await tx.$executeRawUnsafe(`
+            INSERT INTO "categories" ("id", "organizationId", "name", "slug", "createdAt")
+            VALUES ('${rollbackTestId}', '${acmeOrg.id}', 'Rollback Category', 'rollback-category-${Date.now()}', NOW());
+          `);
+          throw new Error('Intentional transaction test abort');
+        },
+        { timeout: 30000, maxWait: 15000 }
+      );
+    } catch (e: any) {
+      if (e.message.includes('Intentional transaction test abort')) {
+        rollbackThrown = true;
+      } else {
+        throw e;
+      }
+    }
+    assert.strictEqual(rollbackThrown, true, 'Transaction abort error was thrown');
+    // Verify rollback in admin prisma
+    const foundRollbackCategory = await prismaAdmin.category.findUnique({
+      where: { id: rollbackTestId },
+    });
+    assert.strictEqual(foundRollbackCategory, null, 'Inserted category must be completely rolled back after exception');
+    console.log('   ✅ PASS: Transaction changes completely rolled back upon exception.');
+
+    // 10. Context Cleanup Verification
+    console.log('\n9. Verifying AsyncLocalStorage Tenant Context Cleanup...');
+    const currentStoreAfter = tenantStorage.getStore();
+    assert.strictEqual(currentStoreAfter, undefined, 'tenantStorage store must be undefined outside of active context');
+    console.log('   ✅ PASS: Tenant context storage is clean and undefined.');
+
+    // 11. Test Client Disconnect & Reconnect
+    console.log('\n10. Testing Client Disconnect & Reconnect...');
+    await appPrisma.$disconnect();
+    const reconnectCheck: any[] = await appPrisma.$queryRawUnsafe('SELECT 1 as connected;');
+    assert.strictEqual(reconnectCheck[0]?.connected, 1, 'Client must reconnect cleanly after explicit disconnect');
+    console.log('   ✅ PASS: Client disconnected and reconnected cleanly.');
 
     console.log('\n🎯 ALL PostgreSQL Row-Level Security (RLS) Tests PASSED (100% Verified)!\n');
   } finally {
