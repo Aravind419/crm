@@ -197,6 +197,56 @@ async function main() {
     if (migrationPrivs.length > 0) {
       throw new Error(`SECURITY VIOLATION: supportos_app retains privileges on _prisma_migrations: ${migrationPrivs.map((p) => p.privilege_type).join(', ')}`);
     }
+
+    // 7. Effective privilege checks (using built-in PostgreSQL has_*_privilege functions)
+    console.log('✅ Effective Privilege Verification:');
+    const effectiveMigration: any[] = await prisma.$queryRaw`
+      SELECT 
+        has_table_privilege('supportos_app', '_prisma_migrations', 'SELECT') AS has_select,
+        has_table_privilege('supportos_app', '_prisma_migrations', 'INSERT') AS has_insert,
+        has_table_privilege('supportos_app', '_prisma_migrations', 'UPDATE') AS has_update,
+        has_table_privilege('supportos_app', '_prisma_migrations', 'DELETE') AS has_delete,
+        has_table_privilege('supportos_app', '_prisma_migrations', 'TRUNCATE') AS has_truncate;
+    `;
+    const em = effectiveMigration[0];
+    if (em?.has_select || em?.has_insert || em?.has_update || em?.has_delete || em?.has_truncate) {
+      throw new Error(`SECURITY VIOLATION: supportos_app has effective privileges on _prisma_migrations! ${JSON.stringify(em)}`);
+    }
+    console.log('   - Effective _prisma_migrations privileges: None (0/5 permitted)');
+
+    // Verify no excess TRUNCATE/TRIGGER/REFERENCES on application tables
+    const tableExcess: any[] = await prisma.$queryRaw`
+      SELECT 
+        has_table_privilege('supportos_app', 'tickets', 'TRUNCATE') AS has_truncate,
+        has_table_privilege('supportos_app', 'tickets', 'TRIGGER') AS has_trigger,
+        has_table_privilege('supportos_app', 'tickets', 'REFERENCES') AS has_references;
+    `;
+    const te = tableExcess[0];
+    if (te?.has_truncate || te?.has_trigger || te?.has_references) {
+      throw new Error(`SECURITY VIOLATION: supportos_app has excess table privileges (TRUNCATE/TRIGGER/REFERENCES)! ${JSON.stringify(te)}`);
+    }
+    console.log('   - Excess table privileges (TRUNCATE/TRIGGER/REFERENCES): None (Clean)');
+
+    // Verify database CREATE privilege
+    const dbPriv: any[] = await prisma.$queryRaw`
+      SELECT has_database_privilege('supportos_app', current_database(), 'CREATE') AS has_create;
+    `;
+    if (dbPriv[0]?.has_create) {
+      throw new Error('SECURITY VIOLATION: supportos_app possesses CREATE privilege on the current database!');
+    }
+    console.log('   - Database CREATE privilege: false (Revoked)');
+
+    // Verify no inherited membership in elevated/superuser roles
+    const inheritedRoles: any[] = await prisma.$queryRaw`
+      SELECT rolname FROM pg_roles
+      WHERE (rolsuper = true OR rolbypassrls = true)
+        AND pg_has_role('supportos_app', rolname, 'MEMBER');
+    `;
+    if (inheritedRoles.length > 0) {
+      throw new Error(`SECURITY VIOLATION: supportos_app has inherited membership in elevated role(s): ${inheritedRoles.map((r: any) => r.rolname).join(', ')}`);
+    }
+    console.log('   - Inherited elevated roles: None (Clean)');
+
     console.log('✅ Migration Table Protection: 0 privileges granted on _prisma_migrations.');
 
     console.log('\n🎉 Successfully provisioned and verified supportos_app security architecture.');

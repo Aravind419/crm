@@ -1,4 +1,4 @@
-import { basePrisma, isPostgreSql } from '../prisma';
+import { internalPrisma, isPostgreSql } from '../prisma';
 
 export interface AuthLookupUser {
   id: string;
@@ -92,7 +92,7 @@ export class AuthLookupService {
     const cleanEmail = email.toLowerCase().trim();
 
     if (isPostgreSql()) {
-      const rows = await basePrisma.$queryRaw<any[]>`
+      const rows = await internalPrisma.$queryRaw<any[]>`
         SELECT * FROM auth_lookup_user_by_email(${cleanEmail})
       `;
       if (!rows || rows.length === 0) return null;
@@ -116,7 +116,7 @@ export class AuthLookupService {
       };
     }
 
-    const user = await basePrisma.user.findFirst({
+    const user = await internalPrisma.user.findFirst({
       where: { email: cleanEmail },
       include: { organization: true },
     });
@@ -148,7 +148,7 @@ export class AuthLookupService {
     if (!tokenHash || typeof tokenHash !== 'string') return null;
 
     if (isPostgreSql()) {
-      const rows = await basePrisma.$queryRaw<any[]>`
+      const rows = await internalPrisma.$queryRaw<any[]>`
         SELECT * FROM auth_lookup_refresh_token(${tokenHash})
       `;
       if (!rows || rows.length === 0) return null;
@@ -168,7 +168,7 @@ export class AuthLookupService {
       };
     }
 
-    const token = await basePrisma.refreshToken.findUnique({
+    const token = await internalPrisma.refreshToken.findUnique({
       where: { tokenHash },
       include: { user: true },
     });
@@ -196,7 +196,7 @@ export class AuthLookupService {
     if (!tokenHash || typeof tokenHash !== 'string') return null;
 
     if (isPostgreSql()) {
-      const rows = await basePrisma.$queryRaw<any[]>`
+      const rows = await internalPrisma.$queryRaw<any[]>`
         SELECT * FROM auth_lookup_user_by_invitation(${tokenHash})
       `;
       if (!rows || rows.length === 0) return null;
@@ -218,7 +218,7 @@ export class AuthLookupService {
       };
     }
 
-    const user = await basePrisma.user.findUnique({
+    const user = await internalPrisma.user.findUnique({
       where: { invitationTokenHash: tokenHash },
       include: { organization: true },
     });
@@ -249,7 +249,7 @@ export class AuthLookupService {
     const cleanSlug = slug.toLowerCase().trim();
 
     if (isPostgreSql()) {
-      const rows = await basePrisma.$queryRaw<any[]>`
+      const rows = await internalPrisma.$queryRaw<any[]>`
         SELECT * FROM auth_lookup_org_by_slug(${cleanSlug})
       `;
       if (!rows || rows.length === 0) return null;
@@ -260,7 +260,7 @@ export class AuthLookupService {
       };
     }
 
-    const org = await basePrisma.organization.findUnique({
+    const org = await internalPrisma.organization.findUnique({
       where: { slug: cleanSlug },
       select: { id: true, name: true, slug: true },
     });
@@ -274,7 +274,7 @@ export class AuthLookupService {
     if (!inboxKey || typeof inboxKey !== 'string') return null;
 
     if (isPostgreSql()) {
-      const rows = await basePrisma.$queryRaw<any[]>`
+      const rows = await internalPrisma.$queryRaw<any[]>`
         SELECT * FROM public_lookup_inbox(${inboxKey})
       `;
       if (!rows || rows.length === 0) return null;
@@ -294,7 +294,7 @@ export class AuthLookupService {
       };
     }
 
-    const inbox = await basePrisma.inbox.findUnique({
+    const inbox = await internalPrisma.inbox.findUnique({
       where: { inboxKey },
       include: { organization: true },
     });
@@ -322,7 +322,7 @@ export class AuthLookupService {
     if (!tokenHash || typeof tokenHash !== 'string') return null;
 
     if (isPostgreSql()) {
-      const rows = await basePrisma.$queryRaw<any[]>`
+      const rows = await internalPrisma.$queryRaw<any[]>`
         SELECT * FROM public_lookup_visitor_session(${tokenHash})
       `;
       if (!rows || rows.length === 0) return null;
@@ -339,7 +339,7 @@ export class AuthLookupService {
       };
     }
 
-    const session = await basePrisma.visitorSession.findFirst({
+    const session = await internalPrisma.visitorSession.findFirst({
       where: { tokenHash },
       include: { inbox: true },
     });
@@ -365,7 +365,7 @@ export class AuthLookupService {
 
     if (isPostgreSql()) {
       try {
-        const rows = await basePrisma.$queryRaw<any[]>`
+        const rows = await internalPrisma.$queryRaw<any[]>`
           SELECT auth_lookup_org_by_record(${table}, ${id}) AS org_id
         `;
         if (!rows || rows.length === 0 || !rows[0].org_id) return null;
@@ -378,7 +378,7 @@ export class AuthLookupService {
 
     // SQLite fallback
     try {
-      const model = (basePrisma as any)[table.replace(/_([a-z])/g, (_, l) => l.toUpperCase()).replace(/s$/, '')];
+      const model = (internalPrisma as any)[table.replace(/_([a-z])/g, (_, l) => l.toUpperCase()).replace(/s$/, '')];
       if (model && typeof model.findUnique === 'function') {
         const rec = await model.findUnique({ where: { id }, select: { organizationId: true } });
         return rec?.organizationId || null;

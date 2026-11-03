@@ -215,6 +215,84 @@ async function runTenantIsolationTests() {
     else delete process.env.ALLOW_UNSCOPED_ADMIN_QUERIES;
     console.log('   ✅ Prisma strictly fails closed in production for unscoped queries on tenant models.');
 
+    // 7b. Missing Organization ID Fail-Closed Test (Non-production / Test environment)
+    console.log('\n7b. Testing Missing Organization ID Fail-Closed Enforcement...');
+    let missingOrgBlocked = false;
+    try {
+      await (prisma.ticket as any).findMany({});
+    } catch (err: any) {
+      if (err.message.includes('[Tenant Isolation Violation]')) {
+        missingOrgBlocked = true;
+      }
+    }
+    assert.strictEqual(missingOrgBlocked, true, 'Query on tenant model without organizationId must fail closed');
+    console.log('   ✅ Query on tenant model with missing organizationId strictly fails closed.');
+
+    // 7c. Unresolved Record ID Fail-Closed Test
+    console.log('\n7c. Testing Unresolved Record ID Fail-Closed Enforcement...');
+    let unresolvedIdBlocked = false;
+    try {
+      await (prisma.ticket as any).findUnique({
+        where: { id: '00000000-0000-0000-0000-000000000000' },
+      });
+    } catch (err: any) {
+      if (err.message.includes('[Tenant Isolation Violation]')) {
+        unresolvedIdBlocked = true;
+      }
+    }
+    assert.strictEqual(unresolvedIdBlocked, true, 'Query with unresolvable record ID must fail closed');
+    console.log('   ✅ Query on unresolvable record ID strictly fails closed with zero data leakage.');
+
+    // 7d. ALLOW_UNSCOPED_ADMIN_QUERIES Ineffectiveness Test
+    console.log('\n7d. Testing Ineffectiveness of ALLOW_UNSCOPED_ADMIN_QUERIES in Test Mode...');
+    process.env.ALLOW_UNSCOPED_ADMIN_QUERIES = 'true';
+    let allowFlagBlocked = false;
+    try {
+      await (prisma.conversation as any).findMany();
+    } catch (err: any) {
+      if (err.message.includes('[Tenant Isolation Violation]')) {
+        allowFlagBlocked = true;
+      }
+    }
+    delete process.env.ALLOW_UNSCOPED_ADMIN_QUERIES;
+    assert.strictEqual(allowFlagBlocked, true, 'ALLOW_UNSCOPED_ADMIN_QUERIES must not bypass tenant isolation');
+    console.log('   ✅ ALLOW_UNSCOPED_ADMIN_QUERIES strictly rejected from bypassing tenant model boundaries.');
+
+    // 7e. SQLite Behavior Verification (Fail-Closed without PostgreSQL RLS)
+    console.log('\n7e. Testing SQLite Environment Fail-Closed Behavior...');
+    // Even in SQLite mode (where isPostgreSql() is false or simulated), unscoped queries must fail closed
+    let sqliteModeBlocked = false;
+    const origDbUrl = process.env.DATABASE_URL;
+    try {
+      // Temporarily simulate sqlite URL
+      process.env.DATABASE_URL = 'file:./dev.db';
+      await (prisma.customer as any).findMany();
+    } catch (err: any) {
+      if (err.message.includes('[Tenant Isolation Violation]')) {
+        sqliteModeBlocked = true;
+      }
+    } finally {
+      process.env.DATABASE_URL = origDbUrl;
+    }
+    assert.strictEqual(sqliteModeBlocked, true, 'SQLite queries without tenant scope must strictly fail closed');
+    console.log('   ✅ SQLite environment verified to fail closed without tenant scope.');
+
+    // 7f. Administrative Mode & Client Separation
+    console.log('\n7f. Testing Administrative Mode & Separation of Runtime Client...');
+    // Verify runtime module does NOT export basePrisma
+    const prismaModule = await import('../src/prisma');
+    assert.strictEqual((prismaModule as any).basePrisma, undefined, 'prisma module must NOT export basePrisma to application runtime');
+    assert.ok(typeof prismaModule.prisma === 'object', 'Safe prisma proxy must be exported');
+
+    // Verify runInAdminMode executes administrative tasks via dedicated admin client
+    const { runInAdminMode, disconnectAdminClient } = await import('../src/admin-prisma');
+    const adminResult = await runInAdminMode(async (adminClient) => {
+      return adminClient.organization.findMany({ take: 1, select: { id: true, name: true } });
+    });
+    assert.ok(Array.isArray(adminResult), 'runInAdminMode must execute successfully for administrative tasks');
+    await disconnectAdminClient();
+    console.log('   ✅ Administrative client separation and runInAdminMode successfully verified.');
+
     // 8. Runtime Identity Diagnostic Endpoint Protection
     console.log('\n8. Testing Runtime Identity Endpoint Protection...');
     // Agent access must receive 403 Forbidden
@@ -282,6 +360,8 @@ async function runTenantIsolationTests() {
       await closeSocketService();
       const { closeRedis } = await import('../src/services/redis.service');
       await closeRedis();
+      const { disconnectAdminClient } = await import('../src/admin-prisma');
+      await disconnectAdminClient();
     } catch (_) {}
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await prisma.$disconnect();

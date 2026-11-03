@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'async_hooks';
 import { Prisma } from '@prisma/client';
-import { basePrisma, isPostgreSql } from '../prisma';
+import { executeTenantTransaction, isPostgreSql } from '../prisma';
 
 export interface TenantContextStore {
   organizationId: string;
@@ -66,7 +66,7 @@ export async function runInTenantContext<T>(
   }
 
   // Interactive transaction establishes transaction-local PostgreSQL RLS context
-  return basePrisma.$transaction(async (tx) => {
+  return executeTenantTransaction(async (tx) => {
     if (isPostgreSql()) {
       // Execute parameterized SET LOCAL via set_config(..., is_local=true)
       // This strictly scopes app.current_organization_id to THIS transaction connection only.

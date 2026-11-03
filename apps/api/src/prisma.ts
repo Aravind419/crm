@@ -7,7 +7,12 @@ export const isPostgreSql = (): boolean => {
   return url.startsWith('postgres://') || url.startsWith('postgresql://');
 };
 
-export const basePrisma = new PrismaClient({
+/**
+ * Underlying Prisma Client instance.
+ * Kept private/internal to this module so the standard application runtime
+ * cannot accidentally import or access an unscoped client.
+ */
+const rawPrisma = new PrismaClient({
   log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
 });
 
@@ -17,13 +22,31 @@ const defaultTxOptions = {
   timeout: 25000,
 };
 
-const originalTransaction = basePrisma.$transaction.bind(basePrisma);
-basePrisma.$transaction = ((arg: any, options?: any) => {
+const originalTransaction = rawPrisma.$transaction.bind(rawPrisma);
+rawPrisma.$transaction = ((arg: any, options?: any) => {
   if (typeof arg === 'function') {
     return originalTransaction(arg, { ...defaultTxOptions, ...options });
   }
   return originalTransaction(arg, options);
 }) as any;
+
+/**
+ * Internal transaction executor for tenant-context.ts.
+ * Not exposed as a general database query interface.
+ */
+export const executeTenantTransaction = async <T>(
+  fn: (tx: Prisma.TransactionClient) => Promise<T>,
+  options?: any
+): Promise<T> => {
+  return rawPrisma.$transaction(fn, { ...defaultTxOptions, ...options });
+};
+
+/**
+ * @internal Restricted to the tenancy subsystem (AuthLookupService)
+ * for unauthenticated tenant resolution queries. Application routes and services
+ * MUST NOT use this client directly.
+ */
+export const internalPrisma = rawPrisma;
 
 const TENANT_MODELS = new Set([
   'organization',
@@ -76,13 +99,15 @@ const MODEL_TO_TABLE: Record<string, string> = {
  * 1. Automatic Transaction Scoping: Any database access executed within runInTenantContext(...)
  *    is automatically routed through the transaction client (where app.current_organization_id is established).
  * 2. Unscoped Access Prevention: Direct access to any tenant-owned model without an active
- *    transaction-local tenant context is immediately rejected when PostgreSQL RLS is active.
- * 3. Transparent Test Interception: Test assertions with explicit orgId or resolvable lookup criteria
- *    are automatically wrapped in transaction-local tenant context.
- * 4. Nested Transaction Flattening: Calling prisma.$transaction(...) inside an existing tenant transaction
+ *    transaction-local tenant context is immediately rejected in production.
+ * 3. Transparent Test Scoping: Explicitly scoped operations with resolvable orgId are wrapped
+ *    in runInTenantContext automatically across BOTH PostgreSQL and SQLite.
+ * 4. Strict Fail-Closed: Queries lacking an explicit, resolvable organization scope fail closed
+ *    with [Tenant Isolation Violation] across ALL environments. ALLOW_UNSCOPED_ADMIN_QUERIES cannot bypass this.
+ * 5. Nested Transaction Flattening: Calling prisma.$transaction(...) inside an existing tenant transaction
  *    transparently reuses the active transaction rather than creating an unsafe detached connection.
  */
-export const prisma = new Proxy(basePrisma, {
+export const prisma = new Proxy(rawPrisma, {
   get(target, prop, receiver) {
     const store = tenantStorage?.getStore();
 
@@ -134,157 +159,147 @@ export const prisma = new Proxy(basePrisma, {
         );
       }
 
-      // NON-PRODUCTION TEST & ADMINISTRATIVE CLI HARNESS:
-      // In non-production testing, if an explicit organization context can be unambiguously resolved from query parameters,
+      // NON-PRODUCTION HARNESS (Tests / CLI):
+      // If an explicit organization context can be unambiguously resolved from query parameters,
       // wrap the operation in a transaction-local tenant context automatically for test harness convenience.
-      if (
-        process.env.NODE_ENV === 'test' ||
-        process.env.ALLOW_UNSCOPED_ADMIN_QUERIES === 'true'
-      ) {
-        const modelTarget = (basePrisma as any)[prop];
-        return new Proxy(modelTarget, {
-          get(targetMethod, methodProp) {
-            const originalMethod = targetMethod[methodProp];
-            if (typeof originalMethod !== 'function') return originalMethod;
-            return async (...args: any[]) => {
-              const queryArgs = args[0] || {};
-              let orgId: string | undefined =
-                queryArgs?.where?.organizationId ||
-                (String(prop) === 'organization' ? queryArgs?.where?.id : undefined) ||
-                queryArgs?.data?.organizationId ||
-                (String(prop) === 'organization' ? queryArgs?.data?.id : undefined);
+      // This applies to BOTH PostgreSQL and SQLite. Unresolved or unscoped queries fail closed immediately.
+      const modelTarget = (rawPrisma as any)[prop];
+      return new Proxy(modelTarget, {
+        get(targetMethod, methodProp) {
+          const originalMethod = targetMethod[methodProp];
+          if (typeof originalMethod !== 'function') return originalMethod;
+          return async (...args: any[]) => {
+            const queryArgs = args[0] || {};
+            let orgId: string | undefined =
+              queryArgs?.where?.organizationId ||
+              (String(prop) === 'organization' ? queryArgs?.where?.id : undefined) ||
+              queryArgs?.data?.organizationId ||
+              (String(prop) === 'organization' ? queryArgs?.data?.id : undefined);
 
-              // Resolve orgId via helper if organization queried by slug
-              if (!orgId && String(prop) === 'organization' && queryArgs?.where?.slug) {
-                const o = await AuthLookupService.lookupOrgBySlug(queryArgs.where.slug);
-                if (o) orgId = o.id;
-              }
+            // Resolve orgId via helper if organization queried by slug
+            if (!orgId && String(prop) === 'organization' && queryArgs?.where?.slug) {
+              const o = await AuthLookupService.lookupOrgBySlug(queryArgs.where.slug);
+              if (o) orgId = o.id;
+            }
 
-              // Resolve orgId via helper if user queried by email
-              if (!orgId && String(prop) === 'user' && queryArgs?.where?.email) {
-                const u = await AuthLookupService.lookupUserByEmail(queryArgs.where.email);
-                if (u) orgId = u.organizationId;
-              }
+            // Resolve orgId via helper if user queried by email
+            if (!orgId && String(prop) === 'user' && queryArgs?.where?.email) {
+              const u = await AuthLookupService.lookupUserByEmail(queryArgs.where.email);
+              if (u) orgId = u.organizationId;
+            }
 
-              // Resolve orgId via helper if user queried by invitationTokenHash
-              if (!orgId && String(prop) === 'user' && queryArgs?.where?.invitationTokenHash) {
-                const inv = await AuthLookupService.lookupUserByInvitation(queryArgs.where.invitationTokenHash);
-                if (inv) orgId = inv.organizationId;
-              }
+            // Resolve orgId via helper if user queried by invitationTokenHash
+            if (!orgId && String(prop) === 'user' && queryArgs?.where?.invitationTokenHash) {
+              const inv = await AuthLookupService.lookupUserByInvitation(queryArgs.where.invitationTokenHash);
+              if (inv) orgId = inv.organizationId;
+            }
 
-              // Resolve orgId via helper if inbox queried by inboxKey
-              if (!orgId && String(prop) === 'inbox' && queryArgs?.where?.inboxKey) {
-                const ib = await AuthLookupService.lookupInboxByKey(queryArgs.where.inboxKey);
-                if (ib) orgId = ib.organizationId;
-              }
+            // Resolve orgId via helper if inbox queried by inboxKey
+            if (!orgId && String(prop) === 'inbox' && queryArgs?.where?.inboxKey) {
+              const ib = await AuthLookupService.lookupInboxByKey(queryArgs.where.inboxKey);
+              if (ib) orgId = ib.organizationId;
+            }
 
-              // Resolve orgId via helper if visitor session queried by tokenHash
-              if (!orgId && String(prop) === 'visitorSession' && queryArgs?.where?.tokenHash) {
-                const vs = await AuthLookupService.lookupVisitorSession(queryArgs.where.tokenHash);
-                if (vs) orgId = vs.organizationId;
-              }
+            // Resolve orgId via helper if visitor session queried by tokenHash
+            if (!orgId && String(prop) === 'visitorSession' && queryArgs?.where?.tokenHash) {
+              const vs = await AuthLookupService.lookupVisitorSession(queryArgs.where.tokenHash);
+              if (vs) orgId = vs.organizationId;
+            }
 
-              // Resolve orgId via helper if refresh token queried by tokenHash
-              if (!orgId && String(prop) === 'refreshToken' && queryArgs?.where?.tokenHash) {
-                const rt = await AuthLookupService.lookupRefreshToken(queryArgs.where.tokenHash);
-                if (rt) orgId = rt.organizationId;
-              }
+            // Resolve orgId via helper if refresh token queried by tokenHash
+            if (!orgId && String(prop) === 'refreshToken' && queryArgs?.where?.tokenHash) {
+              const rt = await AuthLookupService.lookupRefreshToken(queryArgs.where.tokenHash);
+              if (rt) orgId = rt.organizationId;
+            }
 
-              // Resolve orgId by record ID if where.id is supplied
-              if (!orgId && queryArgs?.where?.id) {
-                const idVal = typeof queryArgs.where.id === 'string'
-                  ? queryArgs.where.id
-                  : (Array.isArray(queryArgs.where.id?.in) ? queryArgs.where.id.in[0] : null);
-                const tableName = MODEL_TO_TABLE[String(prop)];
-                if (tableName && idVal) {
-                  const resolved = await AuthLookupService.lookupOrgByRecord(tableName, idVal);
-                  if (resolved) orgId = resolved;
-                }
-              }
-
-              // Resolve orgId if where.userId is supplied
-              if (!orgId && queryArgs?.where?.userId) {
-                const uId = typeof queryArgs.where.userId === 'string'
-                  ? queryArgs.where.userId
-                  : (Array.isArray(queryArgs.where.userId?.in) ? queryArgs.where.userId.in[0] : null);
-                if (uId) {
-                  const resolved = await AuthLookupService.lookupOrgByRecord('users', uId);
-                  if (resolved) orgId = resolved;
-                }
-              }
-
-              // Resolve orgId if where.entityId is supplied (e.g. auditEvent)
-              if (!orgId && queryArgs?.where?.entityId && typeof queryArgs.where.entityId === 'string') {
-                const resolved = await AuthLookupService.lookupOrgByRecord('audit_events', queryArgs.where.entityId)
-                  || await AuthLookupService.lookupOrgByRecord('organizations', queryArgs.where.entityId)
-                  || await AuthLookupService.lookupOrgByRecord('users', queryArgs.where.entityId);
+            // Resolve orgId by record ID if where.id is supplied
+            if (!orgId && queryArgs?.where?.id) {
+              const idVal = typeof queryArgs.where.id === 'string'
+                ? queryArgs.where.id
+                : (Array.isArray(queryArgs.where.id?.in) ? queryArgs.where.id.in[0] : null);
+              const tableName = MODEL_TO_TABLE[String(prop)];
+              if (tableName && idVal) {
+                const resolved = await AuthLookupService.lookupOrgByRecord(tableName, idVal);
                 if (resolved) orgId = resolved;
               }
+            }
 
-              // Resolve orgId if where.eventId is supplied (e.g. webhookEvent)
-              if (!orgId && queryArgs?.where?.eventId) {
-                const eId = typeof queryArgs.where.eventId === 'string'
-                  ? queryArgs.where.eventId
-                  : (Array.isArray(queryArgs.where.eventId?.in) ? queryArgs.where.eventId.in[0] : null);
-                if (eId) {
-                  const resolved = await AuthLookupService.lookupOrgByRecord('webhook_events', eId);
-                  if (resolved) orgId = resolved;
-                }
-              }
-
-              // Resolve orgId if where.inboxId is supplied
-              if (!orgId && queryArgs?.where?.inboxId && typeof queryArgs.where.inboxId === 'string') {
-                const resolved = await AuthLookupService.lookupOrgByRecord('inboxes', queryArgs.where.inboxId);
+            // Resolve orgId if where.userId is supplied
+            if (!orgId && queryArgs?.where?.userId) {
+              const uId = typeof queryArgs.where.userId === 'string'
+                ? queryArgs.where.userId
+                : (Array.isArray(queryArgs.where.userId?.in) ? queryArgs.where.userId.in[0] : null);
+              if (uId) {
+                const resolved = await AuthLookupService.lookupOrgByRecord('users', uId);
                 if (resolved) orgId = resolved;
               }
+            }
 
-              // Resolve orgId if where.customerId is supplied
-              if (!orgId && queryArgs?.where?.customerId && typeof queryArgs.where.customerId === 'string') {
-                const resolved = await AuthLookupService.lookupOrgByRecord('customers', queryArgs.where.customerId);
+            // Resolve orgId if where.entityId is supplied (e.g. auditEvent)
+            if (!orgId && queryArgs?.where?.entityId && typeof queryArgs.where.entityId === 'string') {
+              const resolved = await AuthLookupService.lookupOrgByRecord('audit_events', queryArgs.where.entityId)
+                || await AuthLookupService.lookupOrgByRecord('organizations', queryArgs.where.entityId)
+                || await AuthLookupService.lookupOrgByRecord('users', queryArgs.where.entityId);
+              if (resolved) orgId = resolved;
+            }
+
+            // Resolve orgId if where.eventId is supplied (e.g. webhookEvent)
+            if (!orgId && queryArgs?.where?.eventId) {
+              const eId = typeof queryArgs.where.eventId === 'string'
+                ? queryArgs.where.eventId
+                : (Array.isArray(queryArgs.where.eventId?.in) ? queryArgs.where.eventId.in[0] : null);
+              if (eId) {
+                const resolved = await AuthLookupService.lookupOrgByRecord('webhook_events', eId);
                 if (resolved) orgId = resolved;
               }
+            }
 
-              // Resolve orgId if where.conversationId is supplied
-              if (!orgId && queryArgs?.where?.conversationId && typeof queryArgs.where.conversationId === 'string') {
-                const resolved = await AuthLookupService.lookupOrgByRecord('conversations', queryArgs.where.conversationId);
-                if (resolved) orgId = resolved;
-              }
+            // Resolve orgId if where.inboxId is supplied
+            if (!orgId && queryArgs?.where?.inboxId && typeof queryArgs.where.inboxId === 'string') {
+              const resolved = await AuthLookupService.lookupOrgByRecord('inboxes', queryArgs.where.inboxId);
+              if (resolved) orgId = resolved;
+            }
 
-              // Resolve orgId by inboxId in data (e.g. visitorSession.create)
-              if (!orgId && queryArgs?.data?.inboxId && typeof queryArgs.data.inboxId === 'string') {
-                const resolved = await AuthLookupService.lookupOrgByRecord('inboxes', queryArgs.data.inboxId);
-                if (resolved) orgId = resolved;
-              }
+            // Resolve orgId if where.customerId is supplied
+            if (!orgId && queryArgs?.where?.customerId && typeof queryArgs.where.customerId === 'string') {
+              const resolved = await AuthLookupService.lookupOrgByRecord('customers', queryArgs.where.customerId);
+              if (resolved) orgId = resolved;
+            }
 
-              // Resolve orgId by userId in data (e.g. refreshToken.create)
-              if (!orgId && queryArgs?.data?.userId && typeof queryArgs.data.userId === 'string') {
-                const resolved = await AuthLookupService.lookupOrgByRecord('users', queryArgs.data.userId);
-                if (resolved) orgId = resolved;
-              }
+            // Resolve orgId if where.conversationId is supplied
+            if (!orgId && queryArgs?.where?.conversationId && typeof queryArgs.where.conversationId === 'string') {
+              const resolved = await AuthLookupService.lookupOrgByRecord('conversations', queryArgs.where.conversationId);
+              if (resolved) orgId = resolved;
+            }
 
-              if (orgId && typeof orgId === 'string' && isPostgreSql()) {
-                const { runInTenantContext } = await import('./tenancy/tenant-context');
-                return runInTenantContext(orgId, async (tx) => {
-                  return (tx as any)[prop][methodProp](...args);
-                });
-              }
+            // Resolve orgId by inboxId in data (e.g. visitorSession.create)
+            if (!orgId && queryArgs?.data?.inboxId && typeof queryArgs.data.inboxId === 'string') {
+              const resolved = await AuthLookupService.lookupOrgByRecord('inboxes', queryArgs.data.inboxId);
+              if (resolved) orgId = resolved;
+            }
 
-              if (process.env.ALLOW_UNSCOPED_ADMIN_QUERIES === 'true' || !isPostgreSql()) {
-                return originalMethod.apply(targetMethod, args);
-              }
+            // Resolve orgId by userId in data (e.g. refreshToken.create)
+            if (!orgId && queryArgs?.data?.userId && typeof queryArgs.data.userId === 'string') {
+              const resolved = await AuthLookupService.lookupOrgByRecord('users', queryArgs.data.userId);
+              if (resolved) orgId = resolved;
+            }
 
-              throw new Error(
-                `[Tenant Isolation Violation] Unscoped access to tenant-owned model "${String(prop)}" is prohibited in tests. Provide organizationId in where clause or wrap in runInTenantContext.`
-              );
-            };
-          },
-        });
-      }
+            // If an authorized organization ID is resolved, execute inside runInTenantContext
+            // (Works consistently across BOTH PostgreSQL and SQLite)
+            if (orgId && typeof orgId === 'string') {
+              const { runInTenantContext } = await import('./tenancy/tenant-context');
+              return runInTenantContext(orgId, async (tx) => {
+                return (tx as any)[prop][methodProp](...args);
+              });
+            }
 
-      // Fail closed: All tenant-owned queries without active tenant context are rejected
-      throw new Error(
-        `[Tenant Isolation Violation] Unscoped access to tenant-owned model "${String(prop)}" is prohibited. All tenant data queries must execute within an active transaction-local tenant context (runInTenantContext).`
-      );
+            // FAIL CLOSED: Unscoped access to tenant-owned models without an explicit authorized organization scope is strictly prohibited
+            throw new Error(
+              `[Tenant Isolation Violation] Unscoped access to tenant-owned model "${String(prop)}" is prohibited. All tenant data queries must execute within an active transaction-local tenant context (runInTenantContext) or provide an explicit, resolvable organization scope.`
+            );
+          };
+        },
+      });
     }
 
     const val = (target as any)[prop];

@@ -129,6 +129,48 @@ async function runPostgresRlsTests() {
     }
     assert.strictEqual(migrationBlocked, true, 'supportos_app must be strictly denied access to _prisma_migrations');
 
+    // Effective privilege checks via has_*_privilege
+    const effectiveMigration: any[] = await prismaAdmin.$queryRawUnsafe(`
+      SELECT 
+        has_table_privilege('supportos_app', '_prisma_migrations', 'SELECT') AS has_select,
+        has_table_privilege('supportos_app', '_prisma_migrations', 'INSERT') AS has_insert,
+        has_table_privilege('supportos_app', '_prisma_migrations', 'UPDATE') AS has_update,
+        has_table_privilege('supportos_app', '_prisma_migrations', 'DELETE') AS has_delete,
+        has_table_privilege('supportos_app', '_prisma_migrations', 'TRUNCATE') AS has_truncate;
+    `);
+    const em = effectiveMigration[0];
+    assert.strictEqual(em?.has_select, false, 'supportos_app must not have effective SELECT on _prisma_migrations');
+    assert.strictEqual(em?.has_insert, false, 'supportos_app must not have effective INSERT on _prisma_migrations');
+    assert.strictEqual(em?.has_update, false, 'supportos_app must not have effective UPDATE on _prisma_migrations');
+    assert.strictEqual(em?.has_delete, false, 'supportos_app must not have effective DELETE on _prisma_migrations');
+    assert.strictEqual(em?.has_truncate, false, 'supportos_app must not have effective TRUNCATE on _prisma_migrations');
+
+    // Effective excess privilege checks on application tables (TRUNCATE/TRIGGER/REFERENCES)
+    const tableExcess: any[] = await prismaAdmin.$queryRawUnsafe(`
+      SELECT 
+        has_table_privilege('supportos_app', 'tickets', 'TRUNCATE') AS has_truncate,
+        has_table_privilege('supportos_app', 'tickets', 'TRIGGER') AS has_trigger,
+        has_table_privilege('supportos_app', 'tickets', 'REFERENCES') AS has_references;
+    `);
+    const te = tableExcess[0];
+    assert.strictEqual(te?.has_truncate, false, 'supportos_app must not have TRUNCATE on tickets');
+    assert.strictEqual(te?.has_trigger, false, 'supportos_app must not have TRIGGER on tickets');
+    assert.strictEqual(te?.has_references, false, 'supportos_app must not have REFERENCES on tickets');
+
+    // Effective database CREATE privilege check
+    const dbPriv: any[] = await prismaAdmin.$queryRawUnsafe(`
+      SELECT has_database_privilege('supportos_app', current_database(), 'CREATE') AS has_create;
+    `);
+    assert.strictEqual(dbPriv[0]?.has_create, false, 'supportos_app must not have CREATE on current database');
+
+    // Effective check that supportos_app has NO inherited elevated roles
+    const inheritedRoles: any[] = await prismaAdmin.$queryRawUnsafe(`
+      SELECT rolname FROM pg_roles
+      WHERE (rolsuper = true OR rolbypassrls = true)
+        AND pg_has_role('supportos_app', rolname, 'MEMBER');
+    `);
+    assert.strictEqual(inheritedRoles.length, 0, `supportos_app must not have inherited membership in elevated roles: ${inheritedRoles.map((r: any) => r.rolname).join(', ')}`);
+
     console.log('   ✅ PASS: supportos_app verified (NOSUPERUSER, NOBYPASSRLS, NOCREATEDB, NOCREATEROLE, 0 table ownership, no CREATE on public, 0 migration access).');
 
     // 1. Verify RLS is enabled in pg_class across all tenant tables
