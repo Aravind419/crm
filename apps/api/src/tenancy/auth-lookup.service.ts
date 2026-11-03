@@ -459,7 +459,7 @@ export class AuthLookupService {
       if (isPostgreSql()) {
         try {
           const rows = await tx.$queryRaw<any[]>`
-            SELECT auth_lookup_org_by_record(${table}, ${id}) AS org_id
+            SELECT auth_lookup_org_by_record(${table}, ${cleanId}) AS org_id
           `;
           if (!rows || rows.length === 0 || !rows[0].org_id) return null;
           return rows[0].org_id;
@@ -475,36 +475,36 @@ export class AuthLookupService {
           const model = (tx as any)[modelName];
           if (table === 'visitor_sessions') {
             const rec = await model.findUnique({
-              where: { id },
+              where: { id: cleanId },
               select: { inbox: { select: { organizationId: true } } },
             });
             if (rec?.inbox?.organizationId) return rec.inbox.organizationId;
           } else if (table === 'refresh_tokens') {
             const rec = await model.findUnique({
-              where: { id },
+              where: { id: cleanId },
               select: { user: { select: { organizationId: true } } },
             });
             if (rec?.user?.organizationId) return rec.user.organizationId;
           } else if (table === 'webhook_events') {
             let rec = await model.findUnique({
-              where: { id },
+              where: { id: cleanId },
               select: { organizationId: true },
             }).catch(() => null);
             if (!rec) {
               rec = await model.findUnique({
-                where: { eventId: id },
+                where: { eventId: cleanId },
                 select: { organizationId: true },
               }).catch(() => null);
             }
             if (rec?.organizationId) return rec.organizationId;
           } else if (table === 'team_members') {
             const rec = await model.findUnique({
-              where: { id },
+              where: { id: cleanId },
               select: { team: { select: { organizationId: true } } },
             });
             if (rec?.team?.organizationId) return rec.team.organizationId;
           } else {
-            const rec = await model.findUnique({ where: { id }, select: { organizationId: true } });
+            const rec = await model.findUnique({ where: { id: cleanId }, select: { organizationId: true } });
             if (rec?.organizationId) return rec.organizationId;
           }
         }

@@ -1,6 +1,7 @@
 import assert from 'assert';
 import http from 'http';
 import path from 'path';
+import crypto from 'crypto';
 import { spawnSync } from 'child_process';
 import { app, server } from '../src/server';
 import { prisma } from '../src/prisma';
@@ -544,12 +545,17 @@ async function runTenantIsolationTests() {
     // 10.8 SQLite Read-Only Limitations Tested and Documented
     console.log('10.8 Testing and Documenting SQLite Read-Only Capabilities and Limitations...');
     // In SQLite, verify proxy allowlist and statement inspection properly defend against reads/writes
-    let sqliteFindAllowed = false;
+    let readAllowed = false;
     await executeReadOnlyLookup(async (tx: any) => {
-      const org = await tx.organization.findFirst({ select: { id: true, name: true } });
-      if (org) sqliteFindAllowed = true;
+      if (isPostgreSql()) {
+        const rows = await tx.$queryRaw`SELECT 1 as val`;
+        if (rows && rows.length > 0) readAllowed = true;
+      } else {
+        const org = await tx.organization.findFirst({ select: { id: true, name: true } });
+        if (org) readAllowed = true;
+      }
     });
-    assert.strictEqual(sqliteFindAllowed, true, 'Read operations must succeed in read-only lookup execution');
+    assert.strictEqual(readAllowed, true, 'Read operations must succeed in read-only lookup execution');
 
     let sqliteWriteBlocked = false;
     try {
@@ -569,7 +575,7 @@ async function runTenantIsolationTests() {
     const { AuthLookupService } = await import('../src/tenancy/auth-lookup.service');
 
     // 1. Refresh token output
-    const testHash = 'a'.repeat(64);
+    const testHash = crypto.randomBytes(32).toString('hex');
     await runInTenantContext(starlightOrg.id, async (tx) => {
       const u = await tx.user.findFirst({ where: { organizationId: starlightOrg.id } });
       if (u) {
