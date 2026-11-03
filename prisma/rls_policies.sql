@@ -455,4 +455,6 @@ BEGIN
 END;
 $$;
 REVOKE ALL ON FUNCTION auth_lookup_org_by_record(text, text) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION auth_lookup_org_by_record(text, text) TO supportos_app;
+-- Hardening (Phase 1.5.1): Revoke execute from supportos_app to prevent record-probing or cross-tenant enumeration oracle.
+-- Only administrative migration role retains access if needed for offline tools.
+REVOKE ALL ON FUNCTION auth_lookup_org_by_record(text, text) FROM supportos_app;

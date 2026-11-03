@@ -2,6 +2,7 @@ import assert from 'assert';
 import http from 'http';
 import { app, server } from '../src/server';
 import { prisma } from '../src/prisma';
+import { runInTenantContext } from '../src/tenancy/tenant-context';
 
 const TEST_PORT = 4998;
 
@@ -56,8 +57,10 @@ async function runTenantIsolationTests() {
     });
   });
 
+  let starlightOrg: any = null;
   let starlightConv: any = null;
   let starlightTicket: any = null;
+  let starlightCustomer: any = null;
 
   try {
     // 1. Authenticate Org A (Alex from Acme)
@@ -81,43 +84,45 @@ async function runTenantIsolationTests() {
     const headersB = { Authorization: `Bearer ${tokenB}` };
 
     // Find Starlight's Org ID
-    const starlightOrg = await prisma.organization.findUnique({ where: { slug: 'starlight' } });
+    starlightOrg = loginB.data.organization;
     assert.ok(starlightOrg, 'Starlight organization must exist');
 
-    // Create a private conversation belonging to Starlight
-    const starlightInbox = await prisma.inbox.findFirst({ where: { organizationId: starlightOrg.id } });
-    assert.ok(starlightInbox, 'Starlight inbox must exist');
+    await runInTenantContext(starlightOrg.id, async (tx) => {
+      const starlightInbox = await tx.inbox.findFirst({ where: { organizationId: starlightOrg.id } });
+      assert.ok(starlightInbox, 'Starlight inbox must exist');
 
-    const starlightCustomer =
-      (await prisma.customer.findFirst({
+      const existingCust = await tx.customer.findFirst({
         where: { organizationId: starlightOrg.id, email: 'secret@starlight-shopper.com' },
-      })) ||
-      (await prisma.customer.create({
+      });
+      starlightCustomer =
+        existingCust ||
+        (await tx.customer.create({
+          data: {
+            organizationId: starlightOrg.id,
+            name: 'Starlight Confidential Customer',
+            email: `secret_${Date.now()}@starlight-shopper.com`,
+          },
+        }));
+
+      starlightConv = await tx.conversation.create({
         data: {
           organizationId: starlightOrg.id,
-          name: 'Starlight Confidential Customer',
-          email: `secret_${Date.now()}@starlight-shopper.com`,
+          inboxId: starlightInbox.id,
+          customerId: starlightCustomer.id,
+          status: 'OPEN',
         },
-      }));
+      });
 
-    starlightConv = await prisma.conversation.create({
-      data: {
-        organizationId: starlightOrg.id,
-        inboxId: starlightInbox.id,
-        customerId: starlightCustomer.id,
-        status: 'OPEN',
-      },
-    });
-
-    const randomTicketNum = Math.floor(Math.random() * 800000) + 10000;
-    starlightTicket = await prisma.ticket.create({
-      data: {
-        ticketNumber: randomTicketNum,
-        organizationId: starlightOrg.id,
-        customerId: starlightCustomer.id,
-        title: 'Starlight Confidential Internal Ticket',
-        description: 'Restricted financial data',
-      },
+      const randomTicketNum = Math.floor(Math.random() * 800000) + 10000;
+      starlightTicket = await tx.ticket.create({
+        data: {
+          ticketNumber: randomTicketNum,
+          organizationId: starlightOrg.id,
+          customerId: starlightCustomer.id,
+          title: 'Starlight Confidential Internal Ticket',
+          description: 'Restricted financial data',
+        },
+      });
     });
 
     console.log('1. Testing Unauthenticated Request Rejection...');
@@ -177,11 +182,15 @@ async function runTenantIsolationTests() {
 
     console.log('\n🛡️ ALL TENANT ISOLATION SECURITY TESTS PASSED! ZERO DATA LEAKAGE DETECTED.');
   } finally {
-    if (starlightTicket?.id) {
-      await prisma.ticket.delete({ where: { id: starlightTicket.id } }).catch(() => {});
-    }
-    if (starlightConv?.id) {
-      await prisma.conversation.delete({ where: { id: starlightConv.id } }).catch(() => {});
+    if (starlightOrg?.id) {
+      await runInTenantContext(starlightOrg.id, async (tx) => {
+        if (starlightTicket?.id) {
+          await tx.ticket.delete({ where: { id: starlightTicket.id } }).catch(() => {});
+        }
+        if (starlightConv?.id) {
+          await tx.conversation.delete({ where: { id: starlightConv.id } }).catch(() => {});
+        }
+      }).catch(() => {});
     }
     try {
       const { closeSocketService } = await import('../src/services/socket.service');

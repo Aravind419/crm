@@ -73,8 +73,8 @@ jobs:
         image: postgres:16-alpine
         env:
           POSTGRES_DB: supportos_prod_test
-          POSTGRES_USER: supportos_user
-          POSTGRES_PASSWORD: supportos_ci_secure_password_2026
+          POSTGRES_USER: supportos_admin
+          POSTGRES_PASSWORD: supportos_ci_admin_password_2026
         ports:
           - 5432:5432
         options: >-
@@ -98,8 +98,9 @@ jobs:
       PORT: 4001
       JWT_SECRET: supportos_ci_test_secret_key_random_long_string_2026
       BILLING_WEBHOOK_SECRET: supportos_ci_billing_secret_key_random_long_string_2026
-      DATABASE_URL: "postgresql://supportos_user:supportos_ci_secure_password_2026@localhost:5432/supportos_prod_test?schema=public"
-      DIRECT_URL: "postgresql://supportos_user:supportos_ci_secure_password_2026@localhost:5432/supportos_prod_test?schema=public"
+      DIRECT_URL: "postgresql://supportos_admin:supportos_ci_admin_password_2026@localhost:5432/supportos_prod_test?schema=public"
+      APP_ROLE_PASSWORD: "supportos_ci_app_password_2026"
+      DATABASE_URL: "postgresql://supportos_app:supportos_ci_app_password_2026@localhost:5432/supportos_prod_test?schema=public"
       REDIS_URL: "redis://localhost:6379"
       REQUIRE_REDIS: "true"
 
@@ -124,9 +125,8 @@ jobs:
       - name: Seed PostgreSQL Database
         run: npx tsx prisma/seed.ts
 
-      - name: Apply PostgreSQL Row-Level Security (RLS) Policies
-        run: |
-          PGPASSWORD=supportos_ci_secure_password_2026 psql -h localhost -U supportos_user -d supportos_prod_test -v ON_ERROR_STOP=1 -f prisma/rls_policies.sql
+      - name: Provision PostgreSQL Roles & Apply Row-Level Security (RLS) Policies
+        run: npx tsx scripts/provision-roles.ts
 
       - name: Run Native PostgreSQL RLS Isolation Tests
         run: npm --prefix apps/api run test:postgres-rls
@@ -139,6 +139,9 @@ jobs:
 
       - name: Run Onboarding & Administration Phase 1 Suite against PostgreSQL
         run: npm --prefix apps/api run test:onboarding
+
+      - name: Run Runtime Security & RLS Audit Suite
+        run: npm run audit:runtime
 
       - name: Compile Backend TypeScript Build against PostgreSQL Schema
         run: npm --prefix apps/api run build

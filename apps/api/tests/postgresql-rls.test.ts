@@ -23,19 +23,61 @@ async function runPostgresRlsTests() {
 
   // Application client connecting natively as unprivileged role supportos_app
   const appRolePassword = process.env.APP_ROLE_PASSWORD;
-  const appDatabaseUrl = databaseUrl.includes('supportos_app')
-    ? databaseUrl
-    : (appRolePassword
-        ? databaseUrl.replace(/:\/\/[^:]+:[^@]+@/, `://supportos_app:${appRolePassword}@`)
-        : databaseUrl);
+  let appDatabaseUrl: string;
+
+  if (databaseUrl.includes('supportos_app')) {
+    appDatabaseUrl = databaseUrl;
+  } else if (appRolePassword && appRolePassword.trim()) {
+    appDatabaseUrl = databaseUrl.replace(/:\/\/[^:]+:[^@]+@/, `://supportos_app:${appRolePassword.trim()}@`);
+  } else {
+    throw new Error(
+      'SECURITY CONFIGURATION ERROR: PostgreSQL RLS test requires an unprivileged role connection.\n' +
+      'Either DATABASE_URL must connect as supportos_app or APP_ROLE_PASSWORD must be configured.\n' +
+      'Silent fallback to table owner or administrative role is strictly prohibited.'
+    );
+  }
 
   const appPrisma = new PrismaClient({
     datasources: { db: { url: appDatabaseUrl } },
   });
 
   try {
+    // Verify runtime database identity and role attributes
+    const whoami: any[] = await appPrisma.$queryRawUnsafe('SELECT current_user, session_user;');
+    const connectedRole = whoami[0]?.current_user;
+    console.log(`Connected to PostgreSQL as runtime role: "${connectedRole}"`);
+
+    assert.strictEqual(
+      connectedRole,
+      'supportos_app',
+      `SECURITY VIOLATION: Native RLS tests must execute under unprivileged role "supportos_app", but connected as "${connectedRole}".`
+    );
+
+    // Verify role attributes
+    const roleAttrs: any[] = await prismaAdmin.$queryRawUnsafe(`
+      SELECT rolname, rolsuper, rolbypassrls, rolcanlogin 
+      FROM pg_roles 
+      WHERE rolname = 'supportos_app';
+    `);
+    assert.ok(roleAttrs.length > 0, 'Role supportos_app must exist');
+    assert.strictEqual(roleAttrs[0].rolsuper, false, 'supportos_app must be NOSUPERUSER');
+    assert.strictEqual(roleAttrs[0].rolbypassrls, false, 'supportos_app must be NOBYPASSRLS');
+
+    // Verify zero table ownership
+    const ownedTables: any[] = await prismaAdmin.$queryRawUnsafe(`
+      SELECT tablename 
+      FROM pg_tables 
+      WHERE schemaname = 'public' AND tableowner = 'supportos_app';
+    `);
+    assert.strictEqual(
+      ownedTables.length,
+      0,
+      `SECURITY VIOLATION: supportos_app owns ${ownedTables.length} tables! supportos_app must own 0 tables.`
+    );
+    console.log('   ✅ PASS: supportos_app verified (NOSUPERUSER, NOBYPASSRLS, 0 table ownership).');
+
     // 1. Verify RLS is enabled in pg_class across all tenant tables
-    console.log('1. Verifying PostgreSQL pg_class table security attributes...');
+    console.log('\n1. Verifying PostgreSQL pg_class table security attributes...');
     const tables = [
       'organizations',
       'workspaces',

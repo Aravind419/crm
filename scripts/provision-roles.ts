@@ -111,9 +111,15 @@ async function main() {
     const statements = splitSqlStatements(rlsSql);
 
     console.log(`Executing ${statements.length} policy, function, and privilege statements...`);
-    for (const stmt of statements) {
+    for (let i = 0; i < statements.length; i++) {
+      const stmt = statements[i];
       if (stmt.trim()) {
-        await prisma.$executeRawUnsafe(stmt);
+        try {
+          await prisma.$executeRawUnsafe(stmt);
+        } catch (e: any) {
+          console.error(`Statement ${i + 1}/${statements.length} failed:\n${stmt}\nError: ${e.message}`);
+          throw e;
+        }
       }
     }
 

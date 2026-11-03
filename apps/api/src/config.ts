@@ -34,14 +34,36 @@ export function validateSecurityConfig(customCfg?: Partial<typeof config>): void
   const corsOrigins = customCfg?.corsOrigins ?? config.corsOrigins;
 
   if (nodeEnv === 'production') {
-    if (!jwtSecret || jwtSecret.includes('dev_secret') || jwtSecret.length < 32) {
+    if (process.env.ALLOW_UNSCOPED_ADMIN_QUERIES === 'true') {
       throw new Error(
-        '[CRITICAL SECURITY ERROR] Insecure or missing JWT_SECRET in production environment. A cryptographically strong secret (>= 32 characters) must be configured.'
+        '[CRITICAL SECURITY ERROR] ALLOW_UNSCOPED_ADMIN_QUERIES is strictly prohibited in production. Unscoped database queries cannot bypass tenant isolation in production.'
       );
     }
-    if (!billingWebhookSecret || billingWebhookSecret.includes('dev_billing') || billingWebhookSecret.length < 32) {
+
+    const INSECURE_PATTERNS = [
+      'dev_secret',
+      'dev_billing',
+      'change_in_production',
+      'super_secret',
+      'enterprise_2026',
+      'placeholder',
+      'example',
+      'secret_key',
+      'replace_with',
+      'password123',
+    ];
+
+    const isPredictable = (val: string) =>
+      INSECURE_PATTERNS.some((p) => val.toLowerCase().includes(p));
+
+    if (!jwtSecret || jwtSecret.length < 32 || isPredictable(jwtSecret)) {
       throw new Error(
-        '[CRITICAL SECURITY ERROR] Insecure or missing BILLING_WEBHOOK_SECRET in production environment. A cryptographically strong secret (>= 32 characters) must be configured.'
+        '[CRITICAL SECURITY ERROR] Insecure, missing, or predictable JWT_SECRET in production environment. A cryptographically strong secret (>= 32 characters, non-placeholder) must be configured.'
+      );
+    }
+    if (!billingWebhookSecret || billingWebhookSecret.length < 32 || isPredictable(billingWebhookSecret)) {
+      throw new Error(
+        '[CRITICAL SECURITY ERROR] Insecure, missing, or predictable BILLING_WEBHOOK_SECRET in production environment. A cryptographically strong secret (>= 32 characters, non-placeholder) must be configured.'
       );
     }
     if (requireRedis && (!redisUrl || !redisUrl.trim())) {

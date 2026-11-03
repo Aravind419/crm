@@ -124,11 +124,10 @@ export const prisma = new Proxy(basePrisma, {
 
     // 4. If attempting to access a tenant-owned model without active tenant context:
     if (TENANT_MODELS.has(String(prop))) {
-      // In test mode or admin scripts, allow automatic transaction scoping if explicit org context exists
+      // In test mode or administrative scripts (strictly non-production), allow automatic transaction scoping if explicit org context exists
       if (
-        process.env.NODE_ENV === 'test' ||
-        process.env.ALLOW_UNSCOPED_ADMIN_QUERIES === 'true' ||
-        process.argv.some((arg) => arg.includes('test') || arg.includes('audit'))
+        process.env.NODE_ENV !== 'production' &&
+        (process.env.NODE_ENV === 'test' || process.env.ALLOW_UNSCOPED_ADMIN_QUERIES === 'true')
       ) {
         const modelTarget = (basePrisma as any)[prop];
         return new Proxy(modelTarget, {

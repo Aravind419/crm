@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import * as crypto from 'crypto';
 import * as jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import { prisma } from '../prisma';
+import { prisma, isPostgreSql } from '../prisma';
 import { config } from '../config';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
 import { tenantTransactionMiddleware } from '../middleware/tenant';
@@ -520,6 +520,48 @@ router.get(
       });
     } catch (err: any) {
       res.status(500).json({ error: 'Internal Server Error', message: 'Failed to retrieve profile' });
+    }
+  }
+);
+
+/**
+ * GET /api/v1/auth/session-identity
+ * Runtime identity & transaction context inspection endpoint.
+ * Allows independent verification of the actual database identity (supportos_app)
+ * and transaction-local tenant context (app.current_organization_id) without leaking credentials.
+ */
+router.get(
+  '/session-identity',
+  authMiddleware,
+  tenantTransactionMiddleware,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (isPostgreSql()) {
+        const idQuery: any[] = await prisma.$queryRawUnsafe(`
+          SELECT 
+            current_user AS "currentUser", 
+            session_user AS "sessionUser", 
+            current_database() AS "currentDatabase", 
+            current_setting('app.current_organization_id', true) AS "currentOrganizationId";
+        `);
+        res.json({
+          provider: 'postgresql',
+          currentUser: idQuery[0]?.currentUser,
+          sessionUser: idQuery[0]?.sessionUser,
+          currentDatabase: idQuery[0]?.currentDatabase,
+          currentOrganizationId: idQuery[0]?.currentOrganizationId,
+        });
+      } else {
+        res.json({
+          provider: 'sqlite',
+          currentUser: 'sqlite_local',
+          sessionUser: 'sqlite_local',
+          currentDatabase: 'dev.db',
+          currentOrganizationId: req.organizationId,
+        });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: 'Internal Server Error', message: 'Failed to inspect session identity' });
     }
   }
 );

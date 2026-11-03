@@ -2,7 +2,10 @@ import { PrismaClient } from '@prisma/client';
 import * as crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 
-const prisma = new PrismaClient();
+const dbUrl = process.env.DIRECT_URL || process.env.DATABASE_URL;
+const prisma = new PrismaClient({
+  datasources: dbUrl ? { db: { url: dbUrl } } : undefined,
+});
 
 // Secure bcrypt password hash for seed consistency ($2b$)
 function hashPassword(password: string): string {
