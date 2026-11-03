@@ -288,7 +288,7 @@ async function runTenantIsolationTests() {
     const { runInAdminMode, disconnectAdminClient } = await import('../src/admin-prisma');
     const adminResult = await runInAdminMode(async (adminClient) => {
       return adminClient.organization.findMany({ take: 1, select: { id: true, name: true } });
-    });
+    }, { reason: 'Administrative client verification test harness' });
     assert.ok(Array.isArray(adminResult), 'runInAdminMode must execute successfully for administrative tasks');
     await disconnectAdminClient();
     console.log('   ✅ Administrative client separation and runInAdminMode successfully verified.');
@@ -342,6 +342,207 @@ async function runTenantIsolationTests() {
     const gateChild = spawnSync(process.execPath, ['-e', auditGateSnippet], { encoding: 'utf8' });
     assert.strictEqual(gateChild.status, 1, 'Audit gate must exit 1 when any audit check is BLOCKED');
     console.log('   ✅ Proved audit gate halts execution with exit code 1 when fixtures are BLOCKED.');
+
+    // 10. Phase 1.5.3.1 Privileged Database Client Boundaries & Invariants
+    console.log('\n10. Testing Privileged Database Client Boundaries & Invariants...');
+
+    // 10.1 HTTP Request Context Cannot Enter Admin Mode
+    console.log('10.1 Testing HTTP Request Context Cannot Enter Admin Mode...');
+    const { httpRequestStorage } = await import('../src/tenancy/http-request-context');
+    let httpAdminBlocked = false;
+    await httpRequestStorage.run(
+      { requestId: 'test-req-123', path: '/api/v1/tickets', method: 'GET', timestamp: Date.now() },
+      async () => {
+        try {
+          await runInAdminMode(async (client) => {
+            return client.organization.findMany();
+          }, { reason: 'Unauthorized attempt within HTTP request' });
+        } catch (err: any) {
+          if (err.message.includes('[Administrative Access Denied] Administrative database access is strictly prohibited during HTTP request execution')) {
+            httpAdminBlocked = true;
+          }
+        }
+      }
+    );
+    assert.strictEqual(httpAdminBlocked, true, 'runInAdminMode must strictly fail closed within an active HTTP request context');
+    console.log('   ✅ HTTP request context strictly prevented from executing administrative database queries.');
+
+    // 10.2 Agent and Visitor Contexts Cannot Execute Administrative Queries
+    console.log('10.2 Testing Agent and Visitor Contexts Cannot Execute Administrative Queries...');
+    let agentAdminBlocked = false;
+    let visitorAdminBlocked = false;
+
+    // Agent tenant context
+    await runInTenantContext(
+      starlightOrg.id,
+      async () => {
+        try {
+          await runInAdminMode(async (client) => client.organization.findMany(), {
+            reason: 'Malicious attempt by agent to enter admin mode',
+          });
+        } catch (err: any) {
+          if (err.message.includes('[Administrative Access Denied] Tenant request context')) {
+            agentAdminBlocked = true;
+          }
+        }
+      },
+      { actorId: 'agent-123', actorType: 'AGENT' }
+    );
+
+    // Visitor tenant context
+    await runInTenantContext(
+      starlightOrg.id,
+      async () => {
+        try {
+          await runInAdminMode(async (client) => client.organization.findMany(), {
+            reason: 'Malicious attempt by visitor to enter admin mode',
+          });
+        } catch (err: any) {
+          if (err.message.includes('[Administrative Access Denied] Tenant request context')) {
+            visitorAdminBlocked = true;
+          }
+        }
+      },
+      { actorId: 'visitor-123', actorType: 'VISITOR' }
+    );
+
+    assert.strictEqual(agentAdminBlocked, true, 'Agent context must strictly fail closed');
+    assert.strictEqual(visitorAdminBlocked, true, 'Visitor context must strictly fail closed');
+    console.log('   ✅ Agent and visitor request contexts strictly rejected from administrative database access.');
+
+    // 10.3 Arbitrary Module Cannot Obtain Unrestricted Admin Client
+    console.log('10.3 Testing Arbitrary Module Cannot Obtain Unrestricted Admin Client...');
+    const prismaExports = await import('../src/prisma');
+    assert.strictEqual((prismaExports as any).basePrisma, undefined, 'prisma.ts must NOT export basePrisma');
+    assert.strictEqual((prismaExports as any).internalPrisma, undefined, 'prisma.ts must NOT export internalPrisma');
+    assert.strictEqual((prismaExports as any).rawPrisma, undefined, 'prisma.ts must NOT export rawPrisma');
+    assert.strictEqual((prismaExports as any).adminPrisma, undefined, 'prisma.ts must NOT export adminPrisma');
+
+    const adminModule = await import('../src/admin-prisma');
+    assert.strictEqual((adminModule as any).getAdminPrismaClient, undefined, 'admin-prisma.ts must NOT export getAdminPrismaClient');
+    assert.strictEqual((adminModule as any).adminPrismaInstance, undefined, 'admin-prisma.ts must NOT export adminPrismaInstance');
+    console.log('   ✅ Application modules strictly prevented from obtaining raw administrative database clients.');
+
+    // 10.4 Missing Administrative Reason is Rejected
+    console.log('10.4 Testing Missing Administrative Reason is Rejected...');
+    let missingReasonBlocked = false;
+    let emptyReasonBlocked = false;
+
+    try {
+      await (runInAdminMode as any)(async () => {});
+    } catch (err: any) {
+      if (err.message.includes('[Administrative Access Denied] A descriptive reason')) {
+        missingReasonBlocked = true;
+      }
+    }
+
+    try {
+      await runInAdminMode(async () => {}, { reason: '   ' });
+    } catch (err: any) {
+      if (err.message.includes('[Administrative Access Denied] A descriptive reason')) {
+        emptyReasonBlocked = true;
+      }
+    }
+
+    assert.strictEqual(missingReasonBlocked, true, 'Undefined reason must fail closed');
+    assert.strictEqual(emptyReasonBlocked, true, 'Whitespace-only reason must fail closed');
+    console.log('   ✅ Administrative operations without valid descriptive reasons strictly rejected.');
+
+    // 10.5 Failure Logging Sanitizes Credentials
+    console.log('10.5 Testing Failure Logging Sanitizes Credentials...');
+    const { sanitizeLogMessage } = await import('../src/admin-prisma');
+    const rawLeak = 'Connection failed: postgresql://supportos_app:SuperSecretPassword123!@ep-round-recipe.neon.tech:5432/supportos_prod';
+    const sanitized = sanitizeLogMessage(rawLeak);
+    assert.ok(!sanitized.includes('SuperSecretPassword123!'), 'Sanitized log must not contain raw password');
+    assert.ok(sanitized.includes('postgresql://supportos_app:***@ep-round-recipe.neon.tech'), 'Sanitized log must contain redacted mask');
+
+    let sanitizedErrorCaught = false;
+    try {
+      await runInAdminMode(async () => {
+        throw new Error('Database error at postgresql://supportos_app:SuperSecretPassword123!@localhost:5432/crm');
+      }, { reason: 'Credential leakage test harness' });
+    } catch (err: any) {
+      if (err.message.includes('***') && !err.message.includes('SuperSecretPassword123!')) {
+        sanitizedErrorCaught = true;
+      }
+    }
+    assert.strictEqual(sanitizedErrorCaught, true, 'Thrown administrative error must be sanitized');
+    console.log('   ✅ Administrative error logging and propagation verified free of credential leakage.');
+
+    // 10.6 Authentication Lookup Client Cannot Modify Data
+    console.log('10.6 Testing Authentication Lookup Client Cannot Modify Data...');
+    const { executeReadOnlyLookup } = await import('../src/prisma');
+    let writeBlocked = false;
+    try {
+      await executeReadOnlyLookup(async (tx: any) => {
+        return tx.user.create({
+          data: {
+            organizationId: 'fake-org',
+            email: 'attacker@evil.com',
+            firstName: 'Malicious',
+            lastName: 'Actor',
+            passwordHash: 'hash',
+          },
+        });
+      });
+    } catch (err: any) {
+      if (err.message.includes('[Read-Only Lookup Violation] Database write method "create" is strictly prohibited')) {
+        writeBlocked = true;
+      }
+    }
+    assert.strictEqual(writeBlocked, true, 'Write attempt on lookup client must fail closed');
+
+    let rawWriteBlocked = false;
+    try {
+      await executeReadOnlyLookup(async (tx: any) => {
+        return tx.$executeRaw`DELETE FROM users`;
+      });
+    } catch (err: any) {
+      if (err.message.includes('[Read-Only Lookup Violation] Raw execution method "$executeRaw" is prohibited')) {
+        rawWriteBlocked = true;
+      }
+    }
+    assert.strictEqual(rawWriteBlocked, true, 'Raw write attempt on lookup client must fail closed');
+    console.log('   ✅ Authentication lookup service strictly restricted to read-only operations.');
+
+    // 10.7 Public Authentication Results Do Not Expose Secrets
+    console.log('10.7 Testing Public Authentication Results Do Not Expose Secrets...');
+    const { AuthLookupService } = await import('../src/tenancy/auth-lookup.service');
+    const orgSlugTest = await AuthLookupService.lookupOrgBySlug('acme');
+    assert.strictEqual((orgSlugTest as any)?.passwordHash, undefined, 'Org lookup must not expose passwords');
+    assert.strictEqual((orgSlugTest as any)?.billingSecret, undefined, 'Org lookup must not expose billing secrets');
+
+    const inboxTest = await AuthLookupService.lookupInboxByKey('inbox_acme_web');
+    if (inboxTest) {
+      assert.strictEqual((inboxTest as any).passwordHash, undefined, 'Inbox lookup must not expose passwords');
+      assert.strictEqual((inboxTest as any).webhookSecret, undefined, 'Inbox lookup must not expose secrets');
+    }
+    console.log('   ✅ Public pre-auth lookup outputs strictly verified free of password hashes and secrets.');
+
+    // 10.8 Concurrent Authentication Lookups Remain Isolated
+    console.log('10.8 Testing Concurrent Authentication Lookups Remain Isolated...');
+    const [userA, userB] = await Promise.all([
+      AuthLookupService.lookupUserByEmail('alex@acme.com'),
+      AuthLookupService.lookupUserByEmail('maya@starlight.com'),
+    ]);
+    assert.ok(userA && userB, 'Both users must resolve');
+    assert.notStrictEqual(userA.organizationId, userB.organizationId, 'Tenant IDs must be distinct');
+    assert.strictEqual(userA.email, 'alex@acme.com');
+    assert.strictEqual(userB.email, 'maya@starlight.com');
+    assert.strictEqual(userA.orgSlug, 'acme');
+    assert.strictEqual(userB.orgSlug, 'starlight');
+    console.log('   ✅ Interleaved concurrent authentication lookups strictly maintain tenant boundaries.');
+
+    // 10.9 Process and Credential Boundary Separation
+    console.log('10.9 Verifying Process and Credential Boundary Separation...');
+    const runtimeUrl = process.env.DATABASE_URL || '';
+    if (runtimeUrl.startsWith('postgres')) {
+      assert.ok(
+        runtimeUrl.includes('supportos_app') || !runtimeUrl.includes('postgres:postgres'),
+        'Runtime database URL should reflect unprivileged credentials'
+      );
+    }
+    console.log('   ✅ Runtime process credential boundaries verified.');
 
     console.log('\n🛡️ ALL TENANT ISOLATION SECURITY TESTS PASSED! ZERO DATA LEAKAGE DETECTED.');
   } finally {

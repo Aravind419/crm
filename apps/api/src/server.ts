@@ -17,8 +17,23 @@ import automationRoutes from './routes/automations.routes';
 import reportRoutes from './routes/reports.routes';
 import publicRoutes from './routes/public.routes';
 
+import * as crypto from 'crypto';
+import { httpRequestStorage } from './tenancy/http-request-context';
+
 const app = express();
 const server = http.createServer(app);
+
+// 0. HTTP Request Context Tracker (Prevents privilege escalation to administrative DB mode during HTTP requests)
+app.use((req, res, next) => {
+  const store = {
+    requestId: (req.headers['x-request-id'] as string) || crypto.randomUUID(),
+    path: req.path,
+    method: req.method,
+    ip: req.ip,
+    timestamp: Date.now(),
+  };
+  httpRequestStorage.run(store, () => next());
+});
 
 if (config.trustProxy) {
   app.set('trust proxy', 1);

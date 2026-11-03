@@ -42,11 +42,59 @@ export const executeTenantTransaction = async <T>(
 };
 
 /**
- * @internal Restricted to the tenancy subsystem (AuthLookupService)
- * for unauthenticated tenant resolution queries. Application routes and services
- * MUST NOT use this client directly.
+ * Read-only interface restricted strictly to authentication and pre-tenant resolution queries.
+ * Wraps operations in a read-only guard proxy and enforces database read-only constraints.
+ * Database write operations (create, update, delete, upsert, raw executions) strictly fail closed.
  */
-export const internalPrisma = rawPrisma;
+export const executeReadOnlyLookup = async <T>(
+  queryFn: (client: Prisma.TransactionClient) => Promise<T>
+): Promise<T> => {
+  return rawPrisma.$transaction(async (tx) => {
+    if (isPostgreSql()) {
+      await tx.$executeRaw`SET TRANSACTION READ ONLY`;
+    }
+
+    const readOnlyTx = new Proxy(tx, {
+      get(target, prop, receiver) {
+        if (
+          prop === '$executeRaw' ||
+          prop === '$executeRawUnsafe' ||
+          prop === '$queryRawUnsafe'
+        ) {
+          throw new Error(
+            `[Read-Only Lookup Violation] Raw execution method "${String(prop)}" is prohibited in pre-auth lookup service.`
+          );
+        }
+        const val = (target as any)[prop];
+        if (typeof val === 'object' && val !== null) {
+          return new Proxy(val, {
+            get(modelTarget, methodProp) {
+              const blockedMethods = new Set([
+                'create',
+                'createMany',
+                'update',
+                'updateMany',
+                'upsert',
+                'delete',
+                'deleteMany',
+              ]);
+              if (blockedMethods.has(String(methodProp))) {
+                throw new Error(
+                  `[Read-Only Lookup Violation] Database write method "${String(methodProp)}" is strictly prohibited in authentication lookup service.`
+                );
+              }
+              const method = modelTarget[methodProp];
+              return typeof method === 'function' ? method.bind(modelTarget) : method;
+            },
+          });
+        }
+        return typeof val === 'function' ? val.bind(target) : val;
+      },
+    });
+
+    return queryFn(readOnlyTx as any);
+  }, { timeout: 10000 });
+};
 
 const TENANT_MODELS = new Set([
   'organization',
