@@ -1319,7 +1319,8 @@ async function runRuntimeAudit() {
           data: {
             organizationId: orgA.id,
             email: `deactivated-${Date.now()}@acme.com`,
-            name: 'Deactivated Fixture User',
+            firstName: 'Deactivated',
+            lastName: 'User',
             role: 'AGENT',
             status: 'DEACTIVATED',
             passwordHash: '$2a$10$7EqJtq98hPqEX7fNZaFWoO.K2uQpXvj8ePzqV7v5j1yJ1/G9q4m5C',
