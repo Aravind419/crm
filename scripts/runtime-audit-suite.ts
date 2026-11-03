@@ -1322,6 +1322,7 @@ async function runRuntimeAudit() {
             name: 'Deactivated Fixture User',
             role: 'AGENT',
             status: 'DEACTIVATED',
+            passwordHash: '$2a$10$7EqJtq98hPqEX7fNZaFWoO.K2uQpXvj8ePzqV7v5j1yJ1/G9q4m5C',
           },
         });
       }
