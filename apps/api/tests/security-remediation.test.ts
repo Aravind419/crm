@@ -664,7 +664,7 @@ async function runSecurityRemediationSuite() {
     });
     assert.strictEqual(legacyLogin.status, 200, 'Legacy login must succeed');
 
-    const upgradedUser = await prisma.user.findUnique({ where: { id: legacyUser.id } });
+    const upgradedUser = await prisma.user.findFirst({ where: { id: legacyUser.id, organizationId: convA.organizationId } });
     assert.ok(
       upgradedUser?.passwordHash.startsWith('$2a$') || upgradedUser?.passwordHash.startsWith('$2b$'),
       'Password hash must be dynamically upgraded to bcrypt ($2a$/$2b$)'
@@ -1251,7 +1251,7 @@ async function runSecurityRemediationSuite() {
     assert.strictEqual(legacyLoginRes.status, 200, 'Legacy user login must succeed');
 
     // Verify passwordHash in database is now upgraded to bcrypt ($2b$)
-    const migratedUpgradedUser = await prisma.user.findUnique({ where: { id: migratedUser.id } });
+    const migratedUpgradedUser = await prisma.user.findFirst({ where: { id: migratedUser.id, organizationId: convA.organizationId } });
     assert.ok(migratedUpgradedUser?.passwordHash.startsWith('$2b$'), 'Password hash must be upgraded to bcrypt in database');
     console.log('   ✅ PASS: Legacy SHA-256 user authenticated & password hash dynamically upgraded to bcrypt');
 
@@ -1287,7 +1287,7 @@ async function runSecurityRemediationSuite() {
       body: { email: migratedUser2Email, password: 'WrongPassword123!' },
     });
     assert.strictEqual(badLoginRes.status, 401, 'Invalid password must return 401');
-    const user2AfterBadLogin = await prisma.user.findUnique({ where: { id: migratedUser2.id } });
+    const user2AfterBadLogin = await prisma.user.findFirst({ where: { id: migratedUser2.id, organizationId: convA.organizationId } });
     assert.strictEqual(user2AfterBadLogin?.passwordHash, migratedSha256Hash, 'Password hash must NOT be upgraded on failed attempt');
     console.log('   ✅ PASS: Invalid password for legacy account rejected with 401 and hash remains unchanged');
 

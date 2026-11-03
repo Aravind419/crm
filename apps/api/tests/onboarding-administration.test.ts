@@ -395,8 +395,8 @@ async function runOnboardingAdministrationSuite() {
     assert.strictEqual(acceptRes.data.user.status, 'ACTIVE');
 
     // Verify DB state: token hash cleared to prevent replay attack
-    const activatedAgent = await prisma.user.findUnique({
-      where: { id: agentUserId },
+    const activatedAgent = await prisma.user.findFirst({
+      where: { id: agentUserId, organizationId: orgId },
     });
     assert.strictEqual(activatedAgent?.status, 'ACTIVE');
     assert.strictEqual(activatedAgent?.invitationTokenHash, null, 'Invitation token hash MUST be cleared upon acceptance');
@@ -621,7 +621,7 @@ async function runOnboardingAdministrationSuite() {
     assert.strictEqual(revokeRes.status, 200);
 
     // Verify user record retained in database with DEACTIVATED status
-    const revokedUserDb = await prisma.user.findUnique({ where: { id: extraUserId } });
+    const revokedUserDb = await prisma.user.findFirst({ where: { id: extraUserId, organizationId: orgId } });
     assert.ok(revokedUserDb, 'Revoked user record must be retained in DB, not deleted');
     assert.strictEqual(revokedUserDb.status, 'DEACTIVATED', 'User status must transition to DEACTIVATED');
     assert.strictEqual(revokedUserDb.invitationTokenHash, null, 'Invitation token hash must be cleared');
@@ -629,7 +629,7 @@ async function runOnboardingAdministrationSuite() {
 
     // Verify audit trail recorded revocation
     const revokeAudit = await prisma.auditEvent.findFirst({
-      where: { entityId: extraUserId, action: 'INVITATION_REVOKED' },
+      where: { entityId: extraUserId, organizationId: orgId, action: 'INVITATION_REVOKED' },
     });
     assert.ok(revokeAudit, 'Audit event INVITATION_REVOKED must be preserved');
 
@@ -671,7 +671,7 @@ async function runOnboardingAdministrationSuite() {
     assert.ok(reinviteRes.data.invitationUrl, 'Expected new invitation URL');
     const reinvitedToken = reinviteRes.data.invitationUrl.split('/invite/')[1];
 
-    const reinvitedUserDb = await prisma.user.findUnique({ where: { id: extraUserId } });
+    const reinvitedUserDb = await prisma.user.findFirst({ where: { id: extraUserId, organizationId: orgId } });
     assert.strictEqual(reinvitedUserDb?.status, 'INVITED', 'Re-invited user must transition back to INVITED');
     assert.ok(reinvitedUserDb?.invitationTokenHash, 'New invitation token hash must be set');
 
@@ -786,7 +786,7 @@ async function runOnboardingAdministrationSuite() {
 
     // Verify user in DB is ACTIVE and invitationTokenHash is null
     const raceUserInDb = await prisma.user.findFirst({
-      where: { email: raceEmail },
+      where: { email: raceEmail, organizationId: orgId },
     });
     assert.strictEqual(raceUserInDb?.status, 'ACTIVE');
     assert.strictEqual(raceUserInDb?.invitationTokenHash, null);
@@ -813,7 +813,7 @@ async function runOnboardingAdministrationSuite() {
     assert.strictEqual(bypassRes.data.user.status, 'INVITED', 'Invited user must remain INVITED even if initialPassword was supplied');
 
     const bypassUserDb = await prisma.user.findFirst({
-      where: { email: bypassEmail },
+      where: { email: bypassEmail, organizationId: orgId },
     });
     assert.strictEqual(bypassUserDb?.status, 'INVITED');
     assert.ok(bypassUserDb?.passwordHash.startsWith('UNSET_INVITATION_'), 'Password hash must be unmatchable random token');
@@ -1259,5 +1259,13 @@ runOnboardingAdministrationSuite()
   })
   .catch((err) => {
     console.error('\n❌ Phase 1 Test Suite Failed:', err);
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      try {
+        require('fs').appendFileSync(
+          process.env.GITHUB_STEP_SUMMARY,
+          `\n### ❌ Phase 1 Onboarding & Administration Failure\n\`\`\`\n${err.stack || err.message}\n\`\`\`\n`
+        );
+      } catch (_) {}
+    }
     process.exit(1);
   });

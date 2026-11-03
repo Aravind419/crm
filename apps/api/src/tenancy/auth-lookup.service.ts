@@ -364,11 +364,16 @@ export class AuthLookupService {
     if (!table || !id || typeof id !== 'string') return null;
 
     if (isPostgreSql()) {
-      const rows = await basePrisma.$queryRaw<any[]>`
-        SELECT auth_lookup_org_by_record(${table}, ${id}) AS org_id
-      `;
-      if (!rows || rows.length === 0 || !rows[0].org_id) return null;
-      return rows[0].org_id;
+      try {
+        const rows = await basePrisma.$queryRaw<any[]>`
+          SELECT auth_lookup_org_by_record(${table}, ${id}) AS org_id
+        `;
+        if (!rows || rows.length === 0 || !rows[0].org_id) return null;
+        return rows[0].org_id;
+      } catch {
+        // If execute was revoked from supportos_app, fail safely returning null
+        return null;
+      }
     }
 
     // SQLite fallback
