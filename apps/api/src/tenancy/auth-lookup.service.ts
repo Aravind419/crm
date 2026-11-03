@@ -378,10 +378,65 @@ export class AuthLookupService {
 
     // SQLite fallback
     try {
-      const model = (internalPrisma as any)[table.replace(/_([a-z])/g, (_, l) => l.toUpperCase()).replace(/s$/, '')];
-      if (model && typeof model.findUnique === 'function') {
-        const rec = await model.findUnique({ where: { id }, select: { organizationId: true } });
-        return rec?.organizationId || null;
+      const TABLE_TO_PRISMA_MODEL: Record<string, string> = {
+        organizations: 'organization',
+        workspaces: 'workspace',
+        users: 'user',
+        teams: 'team',
+        team_members: 'teamMember',
+        inboxes: 'inbox',
+        customers: 'customer',
+        conversations: 'conversation',
+        messages: 'message',
+        attachments: 'attachment',
+        tickets: 'ticket',
+        ticket_comments: 'ticketComment',
+        categories: 'category',
+        articles: 'article',
+        automation_rules: 'automationRule',
+        audit_events: 'auditEvent',
+        refresh_tokens: 'refreshToken',
+        webhook_events: 'webhookEvent',
+        visitor_sessions: 'visitorSession',
+      };
+
+      const modelName = TABLE_TO_PRISMA_MODEL[table];
+      if (modelName && (internalPrisma as any)[modelName]) {
+        const model = (internalPrisma as any)[modelName];
+        if (table === 'visitor_sessions') {
+          const rec = await model.findUnique({
+            where: { id },
+            select: { inbox: { select: { organizationId: true } } },
+          });
+          if (rec?.inbox?.organizationId) return rec.inbox.organizationId;
+        } else if (table === 'refresh_tokens') {
+          const rec = await model.findUnique({
+            where: { id },
+            select: { user: { select: { organizationId: true } } },
+          });
+          if (rec?.user?.organizationId) return rec.user.organizationId;
+        } else if (table === 'webhook_events') {
+          let rec = await model.findUnique({
+            where: { id },
+            select: { organizationId: true },
+          }).catch(() => null);
+          if (!rec) {
+            rec = await model.findUnique({
+              where: { eventId: id },
+              select: { organizationId: true },
+            }).catch(() => null);
+          }
+          if (rec?.organizationId) return rec.organizationId;
+        } else if (table === 'team_members') {
+          const rec = await model.findUnique({
+            where: { id },
+            select: { team: { select: { organizationId: true } } },
+          });
+          if (rec?.team?.organizationId) return rec.team.organizationId;
+        } else {
+          const rec = await model.findUnique({ where: { id }, select: { organizationId: true } });
+          if (rec?.organizationId) return rec.organizationId;
+        }
       }
     } catch (_) {}
     return null;

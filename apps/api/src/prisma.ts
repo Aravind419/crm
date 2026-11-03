@@ -172,9 +172,15 @@ export const prisma = new Proxy(rawPrisma, {
             const queryArgs = args[0] || {};
             let orgId: string | undefined =
               queryArgs?.where?.organizationId ||
-              (String(prop) === 'organization' ? queryArgs?.where?.id : undefined) ||
+              (String(prop) === 'organization'
+                ? (typeof queryArgs?.where?.id === 'string'
+                    ? queryArgs.where.id
+                    : (Array.isArray(queryArgs?.where?.id?.in) ? queryArgs.where.id.in[0] : undefined))
+                : undefined) ||
               queryArgs?.data?.organizationId ||
-              (String(prop) === 'organization' ? queryArgs?.data?.id : undefined);
+              (String(prop) === 'organization'
+                ? (typeof queryArgs?.data?.id === 'string' ? queryArgs.data.id : undefined)
+                : undefined);
 
             // Resolve orgId via helper if organization queried by slug
             if (!orgId && String(prop) === 'organization' && queryArgs?.where?.slug) {
@@ -255,21 +261,36 @@ export const prisma = new Proxy(rawPrisma, {
             }
 
             // Resolve orgId if where.inboxId is supplied
-            if (!orgId && queryArgs?.where?.inboxId && typeof queryArgs.where.inboxId === 'string') {
-              const resolved = await AuthLookupService.lookupOrgByRecord('inboxes', queryArgs.where.inboxId);
-              if (resolved) orgId = resolved;
+            if (!orgId && queryArgs?.where?.inboxId) {
+              const ibId = typeof queryArgs.where.inboxId === 'string'
+                ? queryArgs.where.inboxId
+                : (Array.isArray(queryArgs.where.inboxId?.in) ? queryArgs.where.inboxId.in[0] : null);
+              if (ibId) {
+                const resolved = await AuthLookupService.lookupOrgByRecord('inboxes', ibId);
+                if (resolved) orgId = resolved;
+              }
             }
 
             // Resolve orgId if where.customerId is supplied
-            if (!orgId && queryArgs?.where?.customerId && typeof queryArgs.where.customerId === 'string') {
-              const resolved = await AuthLookupService.lookupOrgByRecord('customers', queryArgs.where.customerId);
-              if (resolved) orgId = resolved;
+            if (!orgId && queryArgs?.where?.customerId) {
+              const cId = typeof queryArgs.where.customerId === 'string'
+                ? queryArgs.where.customerId
+                : (Array.isArray(queryArgs.where.customerId?.in) ? queryArgs.where.customerId.in[0] : null);
+              if (cId) {
+                const resolved = await AuthLookupService.lookupOrgByRecord('customers', cId);
+                if (resolved) orgId = resolved;
+              }
             }
 
             // Resolve orgId if where.conversationId is supplied
-            if (!orgId && queryArgs?.where?.conversationId && typeof queryArgs.where.conversationId === 'string') {
-              const resolved = await AuthLookupService.lookupOrgByRecord('conversations', queryArgs.where.conversationId);
-              if (resolved) orgId = resolved;
+            if (!orgId && queryArgs?.where?.conversationId) {
+              const cvId = typeof queryArgs.where.conversationId === 'string'
+                ? queryArgs.where.conversationId
+                : (Array.isArray(queryArgs.where.conversationId?.in) ? queryArgs.where.conversationId.in[0] : null);
+              if (cvId) {
+                const resolved = await AuthLookupService.lookupOrgByRecord('conversations', cvId);
+                if (resolved) orgId = resolved;
+              }
             }
 
             // Resolve orgId by inboxId in data (e.g. visitorSession.create)

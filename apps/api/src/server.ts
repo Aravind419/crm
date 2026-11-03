@@ -175,6 +175,24 @@ if (require.main === module) {
 
   process.on('SIGTERM', () => handleShutdown('SIGTERM'));
   process.on('SIGINT', () => handleShutdown('SIGINT'));
+
+  process.on('unhandledRejection', (reason: any) => {
+    // Neon serverless auto-suspends compute and terminates idle sockets.
+    // Suppress fatal process exit on closed pooled socket notifications.
+    if (reason?.message?.includes('Closed') || reason?.kind === 'Closed') {
+      console.warn('[Prisma/Neon] Idle connection dropped by remote serverless pooler. Ready for next query.');
+      return;
+    }
+    console.warn('[Process] Unhandled Rejection:', reason);
+  });
+
+  process.on('uncaughtException', (err: any) => {
+    if (err?.message?.includes('Closed') || err?.kind === 'Closed') {
+      console.warn('[Prisma/Neon] Idle connection dropped by remote serverless pooler. Ready for next query.');
+      return;
+    }
+    console.error('[Process] Uncaught Exception:', err);
+  });
 }
 
 export { app, server };
