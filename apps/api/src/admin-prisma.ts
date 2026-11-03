@@ -1,6 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import { isHttpRequestActive } from './tenancy/http-request-context';
 import { tenantStorage } from './tenancy/tenant-context';
+import { isServerProcessActive } from './process-identity';
 
 export interface AdminOperationOptions {
   /**
@@ -23,12 +24,28 @@ export function sanitizeLogMessage(message: string): string {
 /**
  * Internal administrative client instance.
  * Strictly NOT exported to ordinary application runtime code.
+ * Requires dedicated maintenance credentials (DIRECT_URL).
  */
 function getInternalAdminClient(): PrismaClient {
   if (!adminPrismaInstance) {
-    const adminUrl = process.env.DIRECT_URL || process.env.DATABASE_URL;
+    const adminUrl = process.env.DIRECT_URL;
+    const isPg = (process.env.DATABASE_URL || '').startsWith('postgres');
+
+    if (isPg && !adminUrl) {
+      throw new Error(
+        '[Administrative Access Denied] Dedicated maintenance credentials (DIRECT_URL) are required for administrative operations.'
+      );
+    }
+
+    if (adminUrl && adminUrl.includes('supportos_app')) {
+      throw new Error(
+        '[Administrative Access Denied] Dedicated maintenance credentials required. Unprivileged application role (supportos_app) cannot execute administrative operations.'
+      );
+    }
+
+    const effectiveUrl = adminUrl || process.env.DATABASE_URL;
     adminPrismaInstance = new PrismaClient({
-      datasources: adminUrl ? { db: { url: adminUrl } } : undefined,
+      datasources: effectiveUrl ? { db: { url: effectiveUrl } } : undefined,
       log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
     });
   }
@@ -38,17 +55,16 @@ function getInternalAdminClient(): PrismaClient {
 /**
  * Explicit Administrative Mode Execution Helper
  *
- * Restricts administrative database access strictly to approved offline maintenance,
+ * Restricts administrative database access strictly to dedicated offline maintenance,
  * system seeding, and migration operations.
  *
  * Security Invariants Enforced:
- * 1. Prohibited during any active HTTP request execution.
- * 2. Prohibited within any active tenant, agent, or visitor transaction context.
- * 3. Requires a valid, non-empty, descriptive administrative reason (>= 5 chars).
- * 4. Caller-provided flags/booleans are never accepted as authorization.
- * 5. In production, administrative operations within the server process are disabled;
- *    administrative scripts must run as separate CLI processes with dedicated credentials.
- * 6. Audit logs execution reason and sanitized error messages without credential leakage.
+ * 1. Prohibited within the HTTP server process, regardless of environment flags.
+ * 2. Prohibited during any active HTTP request execution.
+ * 3. Prohibited within any active tenant, agent, or visitor transaction context.
+ * 4. Requires a valid, non-empty, descriptive administrative reason (>= 5 chars).
+ * 5. Caller-provided flags/booleans are never accepted as authorization.
+ * 6. Emits structured JSON audit events on initiation, success, and sanitized failure.
  */
 export async function runInAdminMode<T>(
   operation: (client: PrismaClient) => Promise<T>,
@@ -61,14 +77,7 @@ export async function runInAdminMode<T>(
     );
   }
 
-  // 2. Reject if invoked within an active HTTP request context
-  if (isHttpRequestActive()) {
-    throw new Error(
-      '[Administrative Access Denied] Administrative database access is strictly prohibited during HTTP request execution.'
-    );
-  }
-
-  // 3. Reject if invoked within an active tenant/agent/visitor context
+  // 2. Reject if invoked within an active tenant/agent/visitor context
   const activeTenantStore = tenantStorage?.getStore();
   if (activeTenantStore !== undefined) {
     throw new Error(
@@ -76,24 +85,63 @@ export async function runInAdminMode<T>(
     );
   }
 
-  // 4. In production, prevent the HTTP application server from executing in-process administrative tasks
-  // Administrative tasks in production must run as dedicated maintenance processes (e.g. scripts/provision-roles.ts, migrations)
-  if (process.env.NODE_ENV === 'production' && process.env.SUPPORTOS_MAINTENANCE_PROCESS !== 'true') {
+  // 3. Reject if invoked within an active HTTP request context
+  if (isHttpRequestActive()) {
     throw new Error(
-      '[Administrative Access Denied] In-process administrative operations are prohibited in production server. Run administrative scripts in a dedicated maintenance process.'
+      '[Administrative Access Denied] Administrative database access is strictly prohibited during HTTP request execution.'
+    );
+  }
+
+  // 4. Reject if invoked within the normal HTTP application server process
+  // The HTTP application process must NEVER execute administrative operations, regardless of env flags
+  if (isServerProcessActive()) {
+    throw new Error(
+      '[Administrative Access Denied] Administrative database access is strictly prohibited within the HTTP server process, regardless of environment flags.'
     );
   }
 
   const sanitizedReason = options.reason.trim().replace(/[\r\n\t]/g, ' ');
-  console.info(`[ADMIN AUDIT] Executing administrative maintenance: "${sanitizedReason}" | Timestamp: ${new Date().toISOString()}`);
+
+  // Structured Audit Event: Initiation
+  const startAudit = {
+    eventType: 'ADMIN_MAINTENANCE_OPERATION_START',
+    timestamp: new Date().toISOString(),
+    reason: sanitizedReason,
+    processId: process.pid,
+    nodeEnv: process.env.NODE_ENV || 'development',
+  };
+  console.info(JSON.stringify(startAudit));
 
   try {
     const client = getInternalAdminClient();
-    return await operation(client);
+    const result = await operation(client);
+
+    // Structured Audit Event: Success
+    const successAudit = {
+      eventType: 'ADMIN_MAINTENANCE_OPERATION_SUCCESS',
+      timestamp: new Date().toISOString(),
+      reason: sanitizedReason,
+      processId: process.pid,
+      status: 'SUCCESS',
+    };
+    console.info(JSON.stringify(successAudit));
+
+    return result;
   } catch (err: any) {
     const rawMsg = err?.message || String(err);
     const sanitizedError = sanitizeLogMessage(rawMsg);
-    console.error(`[ADMIN AUDIT ERROR] Administrative operation failed for "${sanitizedReason}": ${sanitizedError}`);
+
+    // Structured Audit Event: Failure (Redacting all database credentials)
+    const failureAudit = {
+      eventType: 'ADMIN_MAINTENANCE_OPERATION_FAILURE',
+      timestamp: new Date().toISOString(),
+      reason: sanitizedReason,
+      processId: process.pid,
+      error: sanitizedError,
+      status: 'FAILED',
+    };
+    console.error(JSON.stringify(failureAudit));
+
     if (err && typeof err === 'object') {
       err.message = sanitizedError;
     }

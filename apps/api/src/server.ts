@@ -19,6 +19,10 @@ import publicRoutes from './routes/public.routes';
 
 import * as crypto from 'crypto';
 import { httpRequestStorage } from './tenancy/http-request-context';
+import { markAsServerProcess } from './process-identity';
+
+// Mark process as an HTTP application server process
+markAsServerProcess();
 
 const app = express();
 const server = http.createServer(app);

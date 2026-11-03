@@ -1,11 +1,24 @@
 import { PrismaClient, Prisma } from '@prisma/client';
 import { tenantStorage } from './tenancy/tenant-context';
 import { AuthLookupService } from './tenancy/auth-lookup.service';
+import { isServerProcessActive } from './process-identity';
 
 export const isPostgreSql = (): boolean => {
   const url = process.env.DATABASE_URL || '';
   return url.startsWith('postgres://') || url.startsWith('postgresql://');
 };
+
+// Enforce credential separation: runtime DATABASE_URL must not match DIRECT_URL in production or in server process
+if (
+  (process.env.NODE_ENV === 'production' || isServerProcessActive()) &&
+  process.env.DIRECT_URL &&
+  process.env.DATABASE_URL &&
+  process.env.DATABASE_URL.trim() === process.env.DIRECT_URL.trim()
+) {
+  throw new Error(
+    '[Security Violation] Runtime DATABASE_URL must not match DIRECT_URL. Direct database connection credentials are reserved exclusively for dedicated maintenance processes.'
+  );
+}
 
 /**
  * Underlying Prisma Client instance.
@@ -41,6 +54,45 @@ export const executeTenantTransaction = async <T>(
   return rawPrisma.$transaction(fn, { ...defaultTxOptions, ...options });
 };
 
+const PERMITTED_READ_OPERATIONS = new Set([
+  'findUnique',
+  'findUniqueOrThrow',
+  'findFirst',
+  'findFirstOrThrow',
+  'findMany',
+  'count',
+  'aggregate',
+  'groupBy',
+]);
+
+const PROHIBITED_WRITE_ARG_KEYS = new Set([
+  'data',
+  'create',
+  'createMany',
+  'createManyAndReturn',
+  'update',
+  'updateMany',
+  'updateManyAndReturn',
+  'upsert',
+  'delete',
+  'deleteMany',
+  'connectOrCreate',
+]);
+
+function assertNoNestedWrites(obj: any): void {
+  if (!obj || typeof obj !== 'object') return;
+  for (const key of Object.keys(obj)) {
+    if (PROHIBITED_WRITE_ARG_KEYS.has(key)) {
+      throw new Error(
+        `[Read-Only Lookup Violation] Mutating property "${key}" is strictly prohibited in read-only lookup arguments.`
+      );
+    }
+    if (typeof obj[key] === 'object' && obj[key] !== null) {
+      assertNoNestedWrites(obj[key]);
+    }
+  }
+}
+
 /**
  * Read-only interface restricted strictly to authentication and pre-tenant resolution queries.
  * Wraps operations in a read-only guard proxy and enforces database read-only constraints.
@@ -52,39 +104,98 @@ export const executeReadOnlyLookup = async <T>(
   return rawPrisma.$transaction(async (tx) => {
     if (isPostgreSql()) {
       await tx.$executeRaw`SET TRANSACTION READ ONLY`;
+      const settingRows = await tx.$queryRaw<Array<{ current_setting: string }>>`SELECT current_setting('transaction_read_only')`;
+      if (!settingRows || settingRows.length === 0 || settingRows[0]?.current_setting !== 'on') {
+        throw new Error(
+          `[Read-Only Lookup Violation] Failed to verify PostgreSQL read-only transaction state. Expected "on", received "${settingRows?.[0]?.current_setting}".`
+        );
+      }
     }
 
     const readOnlyTx = new Proxy(tx, {
       get(target, prop, receiver) {
-        if (
-          prop === '$executeRaw' ||
-          prop === '$executeRawUnsafe' ||
-          prop === '$queryRawUnsafe'
-        ) {
+        if (prop === '$transaction') {
+          throw new Error(
+            '[Read-Only Lookup Violation] Nested or escaping transactions ($transaction) are prohibited in read-only lookups.'
+          );
+        }
+        if (prop === '$connect' || prop === '$disconnect') {
+          throw new Error(
+            `[Read-Only Lookup Violation] Connection management (${String(prop)}) is prohibited in read-only lookups.`
+          );
+        }
+        if (prop === '$executeRaw' || prop === '$executeRawUnsafe') {
           throw new Error(
             `[Read-Only Lookup Violation] Raw execution method "${String(prop)}" is prohibited in pre-auth lookup service.`
           );
         }
+        if (prop === '$queryRawUnsafe') {
+          throw new Error(
+            '[Read-Only Lookup Violation] Raw unescaped queries ($queryRawUnsafe) are prohibited in pre-auth lookup service.'
+          );
+        }
+        if (prop === '$queryRaw') {
+          return async (stringsOrQuery: any, ...values: any[]) => {
+            let sql = '';
+            if (Array.isArray(stringsOrQuery)) {
+              sql = stringsOrQuery.join(' ');
+            } else if (typeof stringsOrQuery === 'string') {
+              sql = stringsOrQuery;
+            } else if (stringsOrQuery && typeof stringsOrQuery.sql === 'string') {
+              sql = stringsOrQuery.sql;
+            } else if (stringsOrQuery && Array.isArray(stringsOrQuery.strings)) {
+              sql = stringsOrQuery.strings.join(' ');
+            }
+            const cleanSql = sql.trim().toUpperCase();
+            const prohibitedKeywords = [
+              'INSERT',
+              'UPDATE',
+              'DELETE',
+              'DROP',
+              'ALTER',
+              'TRUNCATE',
+              'CREATE',
+              'REPLACE',
+              'GRANT',
+              'REVOKE',
+              'VACUUM',
+              'ATTACH',
+              'DETACH',
+            ];
+            for (const kw of prohibitedKeywords) {
+              const regex = new RegExp(`\\b${kw}\\b`, 'i');
+              if (regex.test(cleanSql)) {
+                throw new Error(
+                  `[Read-Only Lookup Violation] Raw query contains prohibited mutating statement "${kw}".`
+                );
+              }
+            }
+            if (!/^(SELECT|SHOW|WITH|EXPLAIN)\b/i.test(cleanSql)) {
+              throw new Error(
+                `[Read-Only Lookup Violation] Raw query is not an authorized read-only statement.`
+              );
+            }
+            return (target as any).$queryRaw(stringsOrQuery, ...values);
+          };
+        }
+
         const val = (target as any)[prop];
         if (typeof val === 'object' && val !== null) {
           return new Proxy(val, {
             get(modelTarget, methodProp) {
-              const blockedMethods = new Set([
-                'create',
-                'createMany',
-                'update',
-                'updateMany',
-                'upsert',
-                'delete',
-                'deleteMany',
-              ]);
-              if (blockedMethods.has(String(methodProp))) {
+              if (!PERMITTED_READ_OPERATIONS.has(String(methodProp))) {
                 throw new Error(
-                  `[Read-Only Lookup Violation] Database write method "${String(methodProp)}" is strictly prohibited in authentication lookup service.`
+                  `[Read-Only Lookup Violation] Database operation "${String(methodProp)}" is strictly prohibited in authentication lookup service. Permitted operations are: ${Array.from(PERMITTED_READ_OPERATIONS).join(', ')}.`
                 );
               }
               const method = modelTarget[methodProp];
-              return typeof method === 'function' ? method.bind(modelTarget) : method;
+              if (typeof method !== 'function') return method;
+              return async (...args: any[]) => {
+                for (const arg of args) {
+                  assertNoNestedWrites(arg);
+                }
+                return method.apply(modelTarget, args);
+              };
             },
           });
         }

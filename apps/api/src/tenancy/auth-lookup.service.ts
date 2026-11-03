@@ -21,7 +21,6 @@ export interface AuthLookupUser {
 export interface AuthLookupRefreshToken {
   id: string;
   userId: string;
-  tokenHash: string;
   familyId: string;
   revoked: boolean;
   expiresAt: Date;
@@ -67,7 +66,6 @@ export interface PublicLookupVisitorSession {
   inboxId: string;
   customerId: string;
   conversationId: string | null;
-  tokenHash: string;
   expiresAt: Date;
   revokedAt: Date | null;
   organizationId: string;
@@ -222,7 +220,6 @@ export class AuthLookupService {
         return {
           id: r.id,
           userId: r.userId,
-          tokenHash: r.tokenHash,
           familyId: r.familyId,
           revoked: Boolean(r.revoked),
           expiresAt: new Date(r.expiresAt),
@@ -243,7 +240,6 @@ export class AuthLookupService {
       return {
         id: token.id,
         userId: token.userId,
-        tokenHash: token.tokenHash,
         familyId: token.familyId,
         revoked: token.revoked,
         expiresAt: token.expiresAt,
@@ -424,7 +420,6 @@ export class AuthLookupService {
           inboxId: r.inboxId,
           customerId: r.customerId,
           conversationId: r.conversationId,
-          tokenHash: r.tokenHash,
           expiresAt: new Date(r.expiresAt),
           revokedAt: r.revokedAt ? new Date(r.revokedAt) : null,
           organizationId: r.organizationId,
@@ -442,7 +437,6 @@ export class AuthLookupService {
         inboxId: session.inboxId,
         customerId: session.customerId,
         conversationId: session.conversationId,
-        tokenHash: session.tokenHash,
         expiresAt: session.expiresAt,
         revokedAt: session.revokedAt,
         organizationId: session.inbox.organizationId,
@@ -452,11 +446,14 @@ export class AuthLookupService {
 
   /**
    * Resolves organizationId for an arbitrary record by table name and ID.
-   * Input validated: table name must exist in ALLOWED_RECORD_TABLES whitelist; id <= 128 chars.
+   * Input validated: table name must exist in ALLOWED_RECORD_TABLES whitelist; id matches /^[a-zA-Z0-9_-]+$/ and <= 128 chars.
    */
   static async lookupOrgByRecord(table: string, id: string): Promise<string | null> {
     if (!table || !id || typeof id !== 'string' || typeof table !== 'string') return null;
-    if (id.length > 128 || !ALLOWED_RECORD_TABLES.has(table)) return null;
+    const cleanId = id.trim();
+    if (cleanId.length < 1 || cleanId.length > 128 || !/^[a-zA-Z0-9_-]+$/.test(cleanId) || !ALLOWED_RECORD_TABLES.has(table)) {
+      return null;
+    }
 
     return executeReadOnlyLookup(async (tx) => {
       if (isPostgreSql()) {
