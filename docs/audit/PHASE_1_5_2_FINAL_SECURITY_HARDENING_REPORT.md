@@ -215,14 +215,14 @@ All test suites executed against the live Neon PostgreSQL database:
 
 `[VERIFIED: CI]`
 
-The Phase 1.5.2 hardening commit was pushed to `master` and verified via GitHub Actions CI:
+The Phase 1.5.2 & Phase 1.5.3 hardening commits were pushed to `master` and verified via GitHub Actions CI:
 
-- **Commit SHA:** `bcfeae5998e146b71295ab375a493550b59d7a5d`
-- **Workflow Run ID:** `41595106967`
-- **Workflow Run URL:** `https://github.com/Aravind419/crm/actions/runs/41595106967`
-- **Matrix Job 1 (SQLite):** `Build, Lint & Security Test Verification (SQLite)` — **SUCCESS** (Job ID: `125780508139`)
-- **Matrix Job 2 (PostgreSQL):** `PostgreSQL Production Schema & RLS Verification` — **SUCCESS** (Job ID: `125780507748`)
-- **Pass Rate:** **100% (2/2 jobs succeeded, all 14 execution steps passed)**
+- **Latest Commit SHA:** `ab43fd3ff2a2f76b31ea6655b50a9db45f08561e`
+- **Workflow Run ID:** `41603690798`
+- **Workflow Run URL:** `https://github.com/Aravind419/crm/actions/runs/41603690798`
+- **Matrix Job 1 (SQLite):** `Build, Lint & Security Test Verification (SQLite)` — **SUCCESS** (Job ID: `125808220071`)
+- **Matrix Job 2 (PostgreSQL):** `PostgreSQL Production Schema & RLS Verification` — **SUCCESS** (Job ID: `125808220340`)
+- **Pass Rate:** **100% (2/2 jobs succeeded, all 14 PostgreSQL pipeline steps and all SQLite validation steps passed)**
 
 ### Verified CI Pipeline Steps:
 1. Initialize containers (`postgres:16-alpine`, `redis:7-alpine`)
